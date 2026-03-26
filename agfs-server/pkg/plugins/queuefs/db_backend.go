@@ -5,11 +5,13 @@ import (
 	"database/sql"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/plugin/config"
 	"github.com/go-sql-driver/mysql"
 	_ "github.com/go-sql-driver/mysql" // MySQL/TiDB driver
+	_ "github.com/jackc/pgx/v5/stdlib" // PostgreSQL driver
 	_ "github.com/mattn/go-sqlite3"    // SQLite driver
 	log "github.com/sirupsen/logrus"
 )
@@ -33,6 +35,12 @@ type DBBackend interface {
 
 	// RegistryInsertSQL returns the SQL used to register a queue.
 	RegistryInsertSQL() string
+
+	// Rebind rewrites generic placeholders to the backend-specific format.
+	Rebind(query string) string
+
+	// BoolLiteral returns the backend-specific SQL literal for a boolean value.
+	BoolLiteral(value bool) string
 }
 
 // SQLiteDBBackend implements DBBackend for SQLite
@@ -100,6 +108,17 @@ func (b *SQLiteDBBackend) EnsureQueueIndexes(db *sql.DB, tableName string) error
 
 func (b *SQLiteDBBackend) RegistryInsertSQL() string {
 	return "INSERT OR IGNORE INTO queuefs_registry (queue_name, table_name) VALUES (?, ?)"
+}
+
+func (b *SQLiteDBBackend) Rebind(query string) string {
+	return query
+}
+
+func (b *SQLiteDBBackend) BoolLiteral(value bool) string {
+	if value {
+		return "1"
+	}
+	return "0"
 }
 
 // TiDBDBBackend implements DBBackend for TiDB
@@ -257,6 +276,164 @@ func (b *TiDBDBBackend) RegistryInsertSQL() string {
 	return "INSERT IGNORE INTO queuefs_registry (queue_name, table_name) VALUES (?, ?)"
 }
 
+func (b *TiDBDBBackend) Rebind(query string) string {
+	return query
+}
+
+func (b *TiDBDBBackend) BoolLiteral(value bool) string {
+	if value {
+		return "1"
+	}
+	return "0"
+}
+
+// PostgreSQLDBBackend implements DBBackend for PostgreSQL.
+type PostgreSQLDBBackend struct{}
+
+func NewPostgreSQLDBBackend() *PostgreSQLDBBackend {
+	return &PostgreSQLDBBackend{}
+}
+
+func (b *PostgreSQLDBBackend) Open(cfg map[string]interface{}) (*sql.DB, error) {
+	dsn := config.GetStringConfig(cfg, "dsn", "")
+	database := config.GetStringConfig(cfg, "database", "queuedb")
+	if dsn == "" {
+		host := config.GetStringConfig(cfg, "host", "127.0.0.1")
+		port := config.GetStringConfig(cfg, "port", "5432")
+		user := config.GetStringConfig(cfg, "user", "postgres")
+		password := config.GetStringConfig(cfg, "password", "")
+		sslMode := "disable"
+		if config.GetBoolConfig(cfg, "enable_tls", false) {
+			sslMode = "require"
+			if config.GetBoolConfig(cfg, "tls_skip_verify", false) {
+				sslMode = "prefer"
+			}
+		}
+
+		dsn = fmt.Sprintf("host=%s port=%s user=%s dbname=%s sslmode=%s",
+			host, port, user, database, sslMode)
+		if password != "" {
+			dsn += fmt.Sprintf(" password=%s", password)
+		}
+		if serverName := config.GetStringConfig(cfg, "tls_server_name", ""); serverName != "" {
+			dsn += fmt.Sprintf(" host=%s", serverName)
+		}
+	}
+
+	adminDSN := config.GetStringConfig(cfg, "dsn", "")
+	if adminDSN == "" && database != "" {
+		host := config.GetStringConfig(cfg, "host", "127.0.0.1")
+		port := config.GetStringConfig(cfg, "port", "5432")
+		user := config.GetStringConfig(cfg, "user", "postgres")
+		password := config.GetStringConfig(cfg, "password", "")
+		sslMode := "disable"
+		if config.GetBoolConfig(cfg, "enable_tls", false) {
+			sslMode = "require"
+			if config.GetBoolConfig(cfg, "tls_skip_verify", false) {
+				sslMode = "prefer"
+			}
+		}
+		adminDSN = fmt.Sprintf("host=%s port=%s user=%s dbname=postgres sslmode=%s",
+			host, port, user, sslMode)
+		if password != "" {
+			adminDSN += fmt.Sprintf(" password=%s", password)
+		}
+
+		tempDB, err := sql.Open("pgx", adminDSN)
+		if err == nil {
+			defer tempDB.Close()
+			_, err = tempDB.Exec(fmt.Sprintf("CREATE DATABASE %s", quotePostgresIdentifier(database)))
+			if err != nil && !strings.Contains(err.Error(), "already exists") {
+				log.Warnf("[queuefs] Failed to create PostgreSQL database %q: %v", database, err)
+			} else {
+				log.Infof("[queuefs] PostgreSQL database %q created or already exists", database)
+			}
+		}
+	}
+
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open PostgreSQL database: %w", err)
+	}
+
+	db.SetMaxOpenConns(100)
+	db.SetMaxIdleConns(10)
+
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to ping PostgreSQL database: %w", err)
+	}
+
+	return db, nil
+}
+
+func (b *PostgreSQLDBBackend) GetInitSQL() []string {
+	return []string{
+		`CREATE TABLE IF NOT EXISTS queuefs_registry (
+			queue_name TEXT PRIMARY KEY,
+			table_name TEXT NOT NULL,
+			created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+		)`,
+	}
+}
+
+func (b *PostgreSQLDBBackend) SupportsSkipLocked() bool {
+	return true
+}
+
+func (b *PostgreSQLDBBackend) QueueTableDDL(tableName string) string {
+	return fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+		id BIGSERIAL PRIMARY KEY,
+		message_id TEXT NOT NULL,
+		data BYTEA NOT NULL,
+		timestamp BIGINT NOT NULL,
+		created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+		deleted BOOLEAN DEFAULT FALSE,
+		deleted_at TIMESTAMPTZ NULL
+	)`, tableName)
+}
+
+func (b *PostgreSQLDBBackend) EnsureQueueIndexes(db *sql.DB, tableName string) error {
+	indexName := fmt.Sprintf("idx_%s_deleted_id", strings.TrimPrefix(tableName, "queuefs_queue_"))
+	indexSQL := fmt.Sprintf(
+		"CREATE INDEX IF NOT EXISTS %s ON %s(deleted, id)",
+		quotePostgresIdentifier(indexName),
+		tableName,
+	)
+	_, err := db.Exec(indexSQL)
+	if err != nil {
+		return fmt.Errorf("failed to create queue index: %w", err)
+	}
+	return nil
+}
+
+func (b *PostgreSQLDBBackend) RegistryInsertSQL() string {
+	return `INSERT INTO queuefs_registry (queue_name, table_name) VALUES (?, ?) ON CONFLICT (queue_name) DO NOTHING`
+}
+
+func (b *PostgreSQLDBBackend) Rebind(query string) string {
+	var builder strings.Builder
+	builder.Grow(len(query) + 8)
+	argIndex := 1
+	for _, ch := range query {
+		if ch == '?' {
+			builder.WriteByte('$')
+			builder.WriteString(strconv.Itoa(argIndex))
+			argIndex++
+			continue
+		}
+		builder.WriteRune(ch)
+	}
+	return builder.String()
+}
+
+func (b *PostgreSQLDBBackend) BoolLiteral(value bool) string {
+	if value {
+		return "TRUE"
+	}
+	return "FALSE"
+}
+
 // Helper functions
 
 func extractDatabaseName(dsn string, configDB string) string {
@@ -288,6 +465,10 @@ func sanitizeTableName(queueName string) string {
 	return "queuefs_queue_" + tableName
 }
 
+func quotePostgresIdentifier(identifier string) string {
+	return `"` + strings.ReplaceAll(identifier, `"`, `""`) + `"`
+}
+
 // CreateBackend creates the appropriate database backend
 func CreateBackend(cfg map[string]interface{}) (DBBackend, error) {
 	backendType := config.GetStringConfig(cfg, "backend", "memory")
@@ -297,6 +478,8 @@ func CreateBackend(cfg map[string]interface{}) (DBBackend, error) {
 		return NewSQLiteDBBackend(), nil
 	case "tidb", "mysql":
 		return NewTiDBDBBackend(), nil
+	case "pgsql", "postgres", "postgresql":
+		return NewPostgreSQLDBBackend(), nil
 	default:
 		return nil, fmt.Errorf("unsupported database backend: %s", backendType)
 	}

@@ -78,7 +78,7 @@ go test ./pkg/plugins/queuefs/...
 ```
 
 This covers the default in-memory tests plus the local SQLite-backed regression tests.
-TiDB integration tests are gated separately and only run when explicitly enabled.
+TiDB and PostgreSQL integration tests are gated separately and only run when explicitly enabled.
 
 ## Running SQLite Tests
 
@@ -127,6 +127,35 @@ Notes:
 - The tests create a fresh database name for each run, so they do not reuse prior queue tables.
 - If your TiDB instance requires a password, add `TIDB_TEST_PASSWORD=...` to the command.
 - The current TiDB regression coverage lives in `agfs-server/pkg/plugins/queuefs/tidb_backend_test.go`.
+
+## Running PostgreSQL Tests
+
+`queuefs` also includes gated integration tests for the PostgreSQL backend.
+
+For a local Homebrew PostgreSQL instance, you can confirm the installation with:
+
+```bash
+brew info postgresql@17
+```
+
+On this machine, the default service is available at `127.0.0.1:5432` and accepts the current macOS user.
+
+From `agfs/agfs-server`, run:
+
+```bash
+PG_TEST=1 \
+PG_TEST_HOST=127.0.0.1 \
+PG_TEST_PORT=5432 \
+PG_TEST_USER="$USER" \
+go test ./pkg/plugins/queuefs -run 'TestQueueFSPGSQL' -count=1 -v
+```
+
+Notes:
+
+- The PostgreSQL tests are skipped unless `PG_TEST=1` is set.
+- The tests create a fresh database name for each run, so they do not reuse prior queue tables.
+- If your PostgreSQL instance requires a password, add `PG_TEST_PASSWORD=...` to the command.
+- The current PostgreSQL regression coverage lives in `agfs-server/pkg/plugins/queuefs/pgsql_backend_test.go`.
 
 ## License
 

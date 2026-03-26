@@ -43,6 +43,7 @@ const (
 //   - memory (default): In-memory storage
 //   - tidb: TiDB database storage with TLS support
 //   - sqlite: SQLite database storage
+//   - pgsql: PostgreSQL database storage
 type QueueFSPlugin struct {
 	backend  QueueBackend
 	mu       sync.RWMutex // Protects backend operations
@@ -93,14 +94,17 @@ func (q *QueueFSPlugin) Validate(cfg map[string]interface{}) error {
 	// Validate backend type
 	backendType := config.GetStringConfig(cfg, "backend", "memory")
 	validBackends := map[string]bool{
-		"memory":  true,
-		"tidb":    true,
-		"mysql":   true,
-		"sqlite":  true,
-		"sqlite3": true,
+		"memory":     true,
+		"tidb":       true,
+		"mysql":      true,
+		"pgsql":      true,
+		"postgres":   true,
+		"postgresql": true,
+		"sqlite":     true,
+		"sqlite3":    true,
 	}
 	if !validBackends[backendType] {
-		return fmt.Errorf("unsupported backend: %s (valid options: memory, tidb, mysql, sqlite)", backendType)
+		return fmt.Errorf("unsupported backend: %s (valid options: memory, tidb, mysql, pgsql, sqlite)", backendType)
 	}
 
 	// Validate database-related parameters if backend is not memory
@@ -139,6 +143,8 @@ func (q *QueueFSPlugin) Initialize(cfg map[string]interface{}) error {
 		backend = NewMemoryBackend()
 	case "sqlite", "sqlite3":
 		backend = NewSQLiteQueueBackend()
+	case "pgsql", "postgres", "postgresql":
+		backend = NewPostgresQueueBackend()
 	case "tidb", "mysql":
 		backend = NewTiDBQueueBackend()
 	default:
@@ -218,8 +224,21 @@ BACKENDS:
   path = "/queuefs"
 
     [plugins.queuefs.config]
-    backend = "sqlite"
-    db_path = "queue.db"
+     backend = "sqlite"
+     db_path = "queue.db"
+
+  PostgreSQL Backend (local):
+  [plugins.queuefs]
+  enabled = true
+  path = "/queuefs"
+
+    [plugins.queuefs.config]
+    backend = "pgsql"
+    host = "127.0.0.1"
+    port = "5432"
+    user = "postgres"
+    password = ""
+    database = "queuedb"
 
   TiDB Backend (local):
   [plugins.queuefs]
@@ -278,6 +297,7 @@ EXAMPLES:
 BACKEND COMPARISON:
   - memory: Fastest, no persistence, lost on restart
   - sqlite: Good for single server, persistent, file-based
+  - pgsql: Good for local and server deployments, persistent, transactional
   - tidb: Best for production, distributed, scalable, persistent
 `
 }
@@ -289,7 +309,7 @@ func (q *QueueFSPlugin) GetConfigParams() []plugin.ConfigParameter {
 			Type:        "string",
 			Required:    false,
 			Default:     "memory",
-			Description: "Queue backend (memory, tidb, mysql, sqlite, sqlite3)",
+			Description: "Queue backend (memory, tidb, mysql, pgsql, postgres, sqlite, sqlite3)",
 		},
 		{
 			Name:        "db_path",
