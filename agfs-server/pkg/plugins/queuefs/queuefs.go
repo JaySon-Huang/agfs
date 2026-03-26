@@ -45,6 +45,7 @@ const (
 //   - sqlite: SQLite database storage
 type QueueFSPlugin struct {
 	backend  QueueBackend
+	cfg      QueueConfig
 	mu       sync.RWMutex // Protects backend operations
 	metadata plugin.PluginMetadata
 }
@@ -82,6 +83,7 @@ func (q *QueueFSPlugin) Validate(cfg map[string]interface{}) error {
 	// Allowed configuration keys
 	allowedKeys := []string{
 		"backend", "mount_path",
+		"mode", "lease_seconds", "max_attempts", "enable_dead_letter", "consumer_id",
 		// Database-related keys
 		"db_path", "dsn", "user", "password", "host", "port", "database",
 		"enable_tls", "tls_server_name", "tls_skip_verify",
@@ -101,6 +103,10 @@ func (q *QueueFSPlugin) Validate(cfg map[string]interface{}) error {
 	}
 	if !validBackends[backendType] {
 		return fmt.Errorf("unsupported backend: %s (valid options: memory, tidb, mysql, sqlite)", backendType)
+	}
+
+	if _, err := parseQueueConfig(cfg); err != nil {
+		return err
 	}
 
 	// Validate database-related parameters if backend is not memory
@@ -129,10 +135,13 @@ func (q *QueueFSPlugin) Validate(cfg map[string]interface{}) error {
 
 func (q *QueueFSPlugin) Initialize(cfg map[string]interface{}) error {
 	backendType := config.GetStringConfig(cfg, "backend", "memory")
+	queueCfg, err := parseQueueConfig(cfg)
+	if err != nil {
+		return err
+	}
 
 	// Create appropriate backend
 	var backend QueueBackend
-	var err error
 
 	switch backendType {
 	case "memory":
@@ -149,6 +158,7 @@ func (q *QueueFSPlugin) Initialize(cfg map[string]interface{}) error {
 	}
 
 	q.backend = backend
+	q.cfg = queueCfg
 
 	log.Infof("[queuefs] Initialized with backend: %s", backendType)
 	return nil
@@ -925,33 +935,30 @@ func (qfs *queueFS) enqueue(queueName string, data []byte) ([]byte, error) {
 	qfs.plugin.mu.Lock()
 	defer qfs.plugin.mu.Unlock()
 
-	now := time.Now()
-	// Use UUIDv7 for globally unique and time-ordered message ID in distributed environments (e.g., TiDB backend)
-	// UUIDv7 is time-sortable and ensures uniqueness across distributed systems
-	msgUUID, err := uuid.NewV7()
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate UUIDv7: %w", err)
-	}
-	msgID := msgUUID.String()
-	msg := QueueMessage{
-		ID:        msgID,
-		Data:      string(data),
-		Timestamp: now,
-	}
-
-	err = qfs.plugin.backend.Enqueue(queueName, msg)
+	task, err := parseEnqueueTask(data, time.Now().UTC(), qfs.plugin.cfg, func() (string, error) {
+		taskUUID, err := uuid.NewV7()
+		if err != nil {
+			return "", fmt.Errorf("failed to generate UUIDv7: %w", err)
+		}
+		return taskUUID.String(), nil
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	return []byte(msg.ID), nil
+	err = qfs.plugin.backend.Enqueue(queueName, task)
+	if err != nil {
+		return nil, err
+	}
+
+	return []byte(task.ID), nil
 }
 
 func (qfs *queueFS) dequeue(queueName string) ([]byte, error) {
 	qfs.plugin.mu.Lock()
 	defer qfs.plugin.mu.Unlock()
 
-	msg, found, err := qfs.plugin.backend.Dequeue(queueName)
+	task, found, err := qfs.plugin.backend.Dequeue(queueName, qfs.plugin.cfg.ConsumerID, qfs.plugin.cfg.LeaseDuration)
 	if err != nil {
 		return nil, err
 	}
@@ -961,14 +968,22 @@ func (qfs *queueFS) dequeue(queueName string) ([]byte, error) {
 		return []byte("{}"), nil
 	}
 
-	return json.Marshal(msg)
+	if qfs.plugin.cfg.Mode == QueueModeMessage {
+		if err := qfs.plugin.backend.Ack(queueName, task.ID); err != nil {
+			return nil, err
+		}
+		task.LeaseUntil = nil
+		task.Attempt = 0
+	}
+
+	return json.Marshal(task)
 }
 
 func (qfs *queueFS) peek(queueName string) ([]byte, error) {
 	qfs.plugin.mu.RLock()
 	defer qfs.plugin.mu.RUnlock()
 
-	msg, found, err := qfs.plugin.backend.Peek(queueName)
+	task, found, err := qfs.plugin.backend.Peek(queueName)
 	if err != nil {
 		return nil, err
 	}
@@ -978,7 +993,7 @@ func (qfs *queueFS) peek(queueName string) ([]byte, error) {
 		return []byte("{}"), nil
 	}
 
-	return json.Marshal(msg)
+	return json.Marshal(task)
 }
 
 func (qfs *queueFS) size(queueName string) ([]byte, error) {
@@ -1028,9 +1043,9 @@ type queueFileHandle struct {
 
 // handleManager manages open handles for queueFS
 type handleManager struct {
-	handles  map[int64]*queueFileHandle
-	nextID   int64
-	mu       sync.Mutex
+	handles map[int64]*queueFileHandle
+	nextID  int64
+	mu      sync.Mutex
 }
 
 // Global handle manager for queueFS (per plugin instance would be better, but keeping it simple)
