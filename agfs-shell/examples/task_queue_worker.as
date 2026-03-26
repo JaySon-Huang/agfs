@@ -22,6 +22,8 @@ fi
 # Queue operation file paths
 DEQUEUE_FILE=$QUEUE_PATH/dequeue
 SIZE_FILE=$QUEUE_PATH/size
+ACK_FILE=$QUEUE_PATH/ack
+NACK_FILE=$QUEUE_PATH/nack
 
 # Poll interval in seconds
 POLL_INTERVAL=2
@@ -77,13 +79,24 @@ while true; do
     echo "Raw: $task_json"
     echo "----------------------------------------"
 
+    task_id=$(echo "$task_json" | jq -r '.id')
+
     # ==========================================================
     # Add your task processing logic here
-    # You can use $task_json variable to get task data
+    # You can use $task_json to inspect payload, resource_id, etc.
     # ==========================================================
     echo "Processing task #$task_count..."
+
+    if [ -z "$task_id" ]; then
+        echo "Missing task id, skipping"
+        continue
+    fi
+
     sleep 1
-    echo "Task completed!"
+
+    # Ack only after the durable success condition has been reached.
+    echo "{\"id\":\"$task_id\"}" > $ACK_FILE
+    echo "Task completed and acked!"
 
     echo "=========================================="
     echo ""

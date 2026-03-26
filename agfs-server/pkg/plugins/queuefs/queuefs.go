@@ -28,39 +28,31 @@ const (
 	MetaValueQueueStatus  = "status"  // Queue status files (size, stats)
 )
 
-// QueueFSPlugin provides a message queue service through a file system interface.
+// QueueFSPlugin provides queue operations through a filesystem interface.
 // Each queue is a directory containing control files:
 //
-//	/queue_name/enqueue - write to this file to enqueue a message
-//	/queue_name/dequeue - read from this file to dequeue a message
-//	/queue_name/peek    - read to peek at the next message without removing it
-//	                      The peek file's modTime reflects the latest enqueued message timestamp
-//	                      This can be used for implementing poll offset logic
-//	/queue_name/size    - read to get queue size
-//	/queue_name/clear   - write to this file to clear the queue
+//	/queue_name/enqueue - write to this file to enqueue a task
+//	/queue_name/dequeue - read to lease the next task
+//	/queue_name/peek    - read to inspect the next task without leasing it
+//	/queue_name/size    - read the number of immediately consumable tasks
+//	/queue_name/clear   - write to remove all tasks
 //
-// Supports multiple backends:
+// In durable task mode it also exposes:
+//
+//	/queue_name/stats   - read queue state counts
+//	/queue_name/ack     - write {"id":"..."} after durable success
+//	/queue_name/nack    - write failure/retry details
+//	/queue_name/recover - write any payload to requeue expired leases
+//
+// Supported backends:
 //   - memory (default): In-memory storage
-//   - tidb: TiDB database storage with TLS support
-//   - sqlite: SQLite database storage
+//   - tidb/mysql: durable SQL backend for production
+//   - sqlite: durable SQL backend for local development and tests
 type QueueFSPlugin struct {
 	backend  QueueBackend
 	cfg      QueueConfig
 	mu       sync.RWMutex // Protects backend operations
 	metadata plugin.PluginMetadata
-}
-
-// Queue represents a single message queue (for memory backend)
-type Queue struct {
-	messages        []QueueMessage
-	mu              sync.Mutex
-	lastEnqueueTime time.Time // Tracks the timestamp of the most recently enqueued message
-}
-
-type QueueMessage struct {
-	ID        string    `json:"id"`
-	Data      string    `json:"data"`
-	Timestamp time.Time `json:"timestamp"`
 }
 
 // NewQueueFSPlugin creates a new queue plugin
@@ -69,7 +61,7 @@ func NewQueueFSPlugin() *QueueFSPlugin {
 		metadata: plugin.PluginMetadata{
 			Name:        PluginName,
 			Version:     "1.0.0",
-			Description: "Message queue service plugin with multiple queue support and pluggable backends",
+			Description: "Durable task queue plugin with a filesystem interface and pluggable backends",
 			Author:      "AGFS Server",
 		},
 	}
@@ -169,124 +161,54 @@ func (q *QueueFSPlugin) GetFileSystem() filesystem.FileSystem {
 }
 
 func (q *QueueFSPlugin) GetReadme() string {
-	return `QueueFS Plugin - Multiple Message Queue Service
+	return `QueueFS Plugin - Durable Task Queue
 
-This plugin provides multiple message queue services through a file system interface.
-Each queue is a directory containing control files for queue operations.
+QueueFS exposes queues as directories under a filesystem mount. The default
+task mode is durable: dequeue leases work, success requires ack, failure can be
+retried, and expired leases can be recovered.
 
 STRUCTURE:
   /queuefs/
-    README          - This documentation
-    <queue_name>/   - A queue directory
-      enqueue       - Write-only file to enqueue messages
-      dequeue       - Read-only file to dequeue messages
-      peek          - Read-only file to peek at next message
-      size          - Read-only file showing queue size
-      clear         - Write-only file to clear all messages
+    README
+    <queue_name>/
+      enqueue   - write-only
+      dequeue   - read-only
+      peek      - read-only
+      size      - read-only
+      clear     - write-only
+      stats     - read-only, task mode only
+      ack       - write-only, task mode only
+      nack      - write-only, task mode only
+      recover   - write-only, task mode only
 
-WORKFLOW:
-  1. Create a queue:
-     mkdir /queuefs/my_queue
+TASK MODE WORKFLOW:
+  1. mkdir /queuefs/jobs
+  2. echo '{"data":"job-1","task_type":"summary"}' > /queuefs/jobs/enqueue
+  3. cat /queuefs/jobs/dequeue
+  4. echo '{"id":"<task-id>"}' > /queuefs/jobs/ack
 
-  2. Enqueue messages:
-     echo "your message" > /queuefs/my_queue/enqueue
+NACK EXAMPLE:
+  echo '{"id":"<task-id>","error":"temporary failure","retry":true,"retry_after_seconds":30}' > /queuefs/jobs/nack
 
-  3. Dequeue messages:
-     cat /queuefs/my_queue/dequeue
+MODES:
+  mode = "task"    durable lease/ack/nack/recover semantics
+  mode = "message" legacy dequeue-implies-complete semantics
 
-  4. Check queue size:
-     cat /queuefs/my_queue/size
+SQL BACKENDS:
+  backend = "sqlite" for local durable testing
+  backend = "tidb" or "mysql" for production durable storage
 
-  5. Peek without removing:
-     cat /queuefs/my_queue/peek
-
-  6. Clear the queue:
-     echo "" > /queuefs/my_queue/clear
-
-  7. Delete the queue:
-     rm -rf /queuefs/my_queue
-
-NESTED QUEUES:
-  You can create queues in nested directories:
-    mkdir -p /queuefs/logs/errors
-    echo "error: timeout" > /queuefs/logs/errors/enqueue
-    cat /queuefs/logs/errors/dequeue
-
-BACKENDS:
-
-  Memory Backend (default):
-  [plugins.queuefs]
-  enabled = true
-  path = "/queuefs"
-  # No additional config needed for memory backend
-
-  SQLite Backend:
-  [plugins.queuefs]
-  enabled = true
-  path = "/queuefs"
-
-    [plugins.queuefs.config]
-    backend = "sqlite"
-    db_path = "queue.db"
-
-  TiDB Backend (local):
+CONFIG EXAMPLE:
   [plugins.queuefs]
   enabled = true
   path = "/queuefs"
 
     [plugins.queuefs.config]
     backend = "tidb"
-    host = "127.0.0.1"
-    port = "4000"
-    user = "root"
-    password = ""
-    database = "queuedb"
-
-  TiDB Cloud Backend (with TLS):
-  [plugins.queuefs]
-  enabled = true
-  path = "/queuefs"
-
-    [plugins.queuefs.config]
-    backend = "tidb"
-    user = "3YdGXuXNdAEmP1f.root"
-    password = "your_password"
-    host = "gateway01.us-west-2.prod.aws.tidbcloud.com"
-    port = "4000"
-    database = "queuedb"
-    enable_tls = true
-    tls_server_name = "gateway01.us-west-2.prod.aws.tidbcloud.com"
-
-EXAMPLES:
-  # Create multiple queues
-  agfs:/> mkdir /queuefs/orders
-  agfs:/> mkdir /queuefs/notifications
-  agfs:/> mkdir /queuefs/logs/errors
-
-  # Enqueue messages to different queues
-  agfs:/> echo "order-123" > /queuefs/orders/enqueue
-  agfs:/> echo "user login" > /queuefs/notifications/enqueue
-  agfs:/> echo "connection timeout" > /queuefs/logs/errors/enqueue
-
-  # Check queue sizes
-  agfs:/> cat /queuefs/orders/size
-  1
-
-  # Dequeue messages
-  agfs:/> cat /queuefs/orders/dequeue
-  {"id":"...","data":"order-123","timestamp":"..."}
-
-  # List all queues
-  agfs:/> ls /queuefs/
-  README  orders  notifications  logs
-
-  # Delete a queue when done
-  agfs:/> rm -rf /queuefs/orders
-
-BACKEND COMPARISON:
-  - memory: Fastest, no persistence, lost on restart
-  - sqlite: Good for single server, persistent, file-based
-  - tidb: Best for production, distributed, scalable, persistent
+    mode = "task"
+    lease_seconds = 300
+    max_attempts = 16
+    enable_dead_letter = true
 `
 }
 
@@ -298,6 +220,41 @@ func (q *QueueFSPlugin) GetConfigParams() []plugin.ConfigParameter {
 			Required:    false,
 			Default:     "memory",
 			Description: "Queue backend (memory, tidb, mysql, sqlite, sqlite3)",
+		},
+		{
+			Name:        "mode",
+			Type:        "string",
+			Required:    false,
+			Default:     "task",
+			Description: "Queue mode (task for durable lease/ack semantics, message for legacy dequeue-implies-complete semantics)",
+		},
+		{
+			Name:        "lease_seconds",
+			Type:        "int",
+			Required:    false,
+			Default:     "300",
+			Description: "Lease duration in seconds for dequeued tasks in task mode",
+		},
+		{
+			Name:        "max_attempts",
+			Type:        "int",
+			Required:    false,
+			Default:     "16",
+			Description: "Default max attempts for tasks that do not specify one explicitly",
+		},
+		{
+			Name:        "enable_dead_letter",
+			Type:        "bool",
+			Required:    false,
+			Default:     "true",
+			Description: "Whether retry exhaustion transitions tasks to dead_lettered instead of failed",
+		},
+		{
+			Name:        "consumer_id",
+			Type:        "string",
+			Required:    false,
+			Default:     "",
+			Description: "Optional consumer identifier recorded in leased_by on dequeue",
 		},
 		{
 			Name:        "db_path",

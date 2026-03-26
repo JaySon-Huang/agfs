@@ -1,74 +1,104 @@
-# QueueFS Plugin - Message Queue Service
+# QueueFS Plugin - Durable Task Queue
 
-This plugin provides a message queue service through a file system interface.
+QueueFS exposes queues as directories inside AGFS.
+
+In `task` mode, `dequeue` leases work instead of deleting it permanently. Workers
+must `ack` on durable success or `nack` on failure. Expired leases can be
+recovered through `recover`.
 
 ## Files
+
+Base files on every queue:
+
 ```bash
-/enqueue  # Write-only file to enqueue messages
-/dequeue  # Read-only file to dequeue messages
-/peek     # Read-only file to peek at next message
-/size     # Read-only file showing queue size
-/clear    # Write-only file to clear all messages
-/README   # This file
+/enqueue  # Write-only: enqueue a task
+/dequeue  # Read-only: lease the next task
+/peek     # Read-only: inspect the next task without leasing it
+/size     # Read-only: count immediately consumable tasks
+/clear    # Write-only: remove all tasks
+/README   # Plugin documentation
 ```
 
-## Dynamic Mounting With AGFS Shell
+Additional files in `task` mode:
 
-Interactive shell:
-```bash  
-agfs:/> mount queuefs /queue
-agfs:/> mount queuefs /tasks
-agfs:/> mount queuefs /messages
-```
-Direct command:
 ```bash
-uv run agfs mount queuefs /queue
-uv run agfs mount queuefs /jobs
+/stats    # Read-only: JSON counts by task state
+/ack      # Write-only: {"id":"task-id"}
+/nack     # Write-only: {"id":"task-id","error":"...","retry":true,"retry_after_seconds":30}
+/recover  # Write-only: requeue expired processing tasks
 ```
 
-## Configuration Parameters
+## Modes
 
-None required - QueueFS works with default settings
+```toml
+mode = "task"    # durable lease/ack/nack/recover semantics
+mode = "message" # legacy dequeue-implies-complete behavior
+```
+
+## Configuration
+
+```toml
+[plugins.queuefs]
+enabled = true
+path = "/queuefs"
+
+  [plugins.queuefs.config]
+  backend = "tidb"          # memory | sqlite | tidb | mysql
+  mode = "task"
+  lease_seconds = 300
+  max_attempts = 16
+  enable_dead_letter = true
+  consumer_id = ""
+```
+
+SQLite example:
+
+```toml
+[plugins.queuefs]
+enabled = true
+path = "/queuefs"
+
+  [plugins.queuefs.config]
+  backend = "sqlite"
+  db_path = "queuefs.db"
+  mode = "task"
+```
 
 ## Usage
-Enqueue a message:
+
+Create a queue:
+
 ```bash
-echo "your message" > /enqueue
+mkdir /queuefs/jobs
 ```
 
-Dequeue a message:
-```bash    
-cat /dequeue
-```
+Enqueue a raw string payload:
 
-Peek at next message (without removing):
-```bash    
-cat /peek
-```
-
-Get queue size:
-```bash    
-cat /size
-```
-
-Clear the queue:
 ```bash
-echo "" > /clear
+echo "hello" > /queuefs/jobs/enqueue
 ```
 
-## Example
+Enqueue a structured task envelope:
+
 ```bash
-# Enqueue a message  
-agfs:/> echo "task-123" > /queuefs/enqueue
-
-# Check queue size
-agfs:/> cat /queuefs/size
-1
-# Dequeue a message
-agfs:/> cat /queuefs/dequeue
-{"id":"...","data":"task-123","timestamp":"..."}
+echo '{"data":"hello","task_type":"summary","resource_id":"doc-1","resource_version":"v1"}' > /queuefs/jobs/enqueue
 ```
 
-## License
+Lease and ack:
 
-Apache License 2.0
+```bash
+cat /queuefs/jobs/dequeue
+echo '{"id":"<task-id>"}' > /queuefs/jobs/ack
+```
+
+Retry with delay:
+
+```bash
+echo '{"id":"<task-id>","error":"temporary failure","retry":true,"retry_after_seconds":30}' > /queuefs/jobs/nack
+```
+
+Recover expired leases:
+
+```bash
+echo "" > /queuefs/jobs/recover
+```
