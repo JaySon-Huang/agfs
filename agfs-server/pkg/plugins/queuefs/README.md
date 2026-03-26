@@ -69,6 +69,65 @@ agfs:/> cat /queuefs/dequeue
 {"id":"...","data":"task-123","timestamp":"..."}
 ```
 
+## Running Tests
+
+From `agfs/agfs-server`, run the full `queuefs` test suite with:
+
+```bash
+go test ./pkg/plugins/queuefs/...
+```
+
+This covers the default in-memory tests plus the local SQLite-backed regression tests.
+TiDB integration tests are gated separately and only run when explicitly enabled.
+
+## Running SQLite Tests
+
+`queuefs` includes regression tests that exercise the real SQLite-backed implementation.
+
+To run only the SQLite-specific regression tests and bypass the Go test cache:
+
+```bash
+go test ./pkg/plugins/queuefs -run 'TestQueueFSSQLite' -count=1 -v
+```
+
+These tests create temporary `.db` files with `t.TempDir()` and initialize the plugin with:
+
+```go
+map[string]interface{}{
+    "backend": "sqlite",
+    "db_path": dbPath,
+}
+```
+
+The current SQLite regression coverage lives in `agfs-server/pkg/plugins/queuefs/sqlite_backend_test.go`.
+
+## Running TiDB Tests
+
+`queuefs` also includes gated integration tests for the TiDB backend.
+
+For a local playground started with:
+
+```bash
+tiup playground v8.5.5 --tiflash 0 --without-monitor
+```
+
+From `agfs/agfs-server`, run:
+
+```bash
+TIDB_TEST=1 \
+TIDB_TEST_HOST=127.0.0.1 \
+TIDB_TEST_PORT=4000 \
+TIDB_TEST_USER=root \
+go test ./pkg/plugins/queuefs -run 'TestQueueFSTiDB' -count=1 -v
+```
+
+Notes:
+
+- The TiDB tests are skipped unless `TIDB_TEST=1` is set.
+- The tests create a fresh database name for each run, so they do not reuse prior queue tables.
+- If your TiDB instance requires a password, add `TIDB_TEST_PASSWORD=...` to the command.
+- The current TiDB regression coverage lives in `agfs-server/pkg/plugins/queuefs/tidb_backend_test.go`.
+
 ## License
 
 Apache License 2.0
