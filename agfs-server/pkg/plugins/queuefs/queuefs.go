@@ -24,8 +24,8 @@ const (
 
 // Meta values for QueueFS plugin
 const (
-	MetaValueQueueControl = "control" // Queue control files (enqueue, dequeue, peek, clear)
-	MetaValueQueueStatus  = "status"  // Queue status files (size)
+	MetaValueQueueControl = "control" // Queue control files (enqueue, dequeue, ack, nack, recover, clear)
+	MetaValueQueueStatus  = "status"  // Queue status files (size, stats)
 )
 
 // QueueFSPlugin provides a message queue service through a file system interface.
@@ -393,8 +393,15 @@ var queueOperations = map[string]bool{
 	"dequeue": true,
 	"peek":    true,
 	"size":    true,
+	"stats":   true,
+	"ack":     true,
+	"nack":    true,
+	"recover": true,
 	"clear":   true,
 }
+
+var baseQueueOperations = []string{"enqueue", "dequeue", "peek", "size", "clear"}
+var durableQueueOperations = []string{"stats", "ack", "nack", "recover"}
 
 // parseQueuePath parses a path like "/queue_name/operation" or "/dir/queue_name/operation"
 // Returns (queueName, operation, isDir, error)
@@ -436,6 +443,26 @@ func parseQueuePath(path string) (queueName string, operation string, isDir bool
 // isValidQueueOperation checks if an operation name is valid
 func isValidQueueOperation(op string) bool {
 	return queueOperations[op]
+}
+
+func (qfs *queueFS) isOperationEnabled(operation string) bool {
+	if !queueOperations[operation] {
+		return false
+	}
+
+	switch operation {
+	case "stats", "ack", "nack", "recover":
+		return qfs.plugin.cfg.Mode == QueueModeTask
+	default:
+		return true
+	}
+}
+
+func (qfs *queueFS) operationExists(queueName string, operation string) error {
+	if qfs.isOperationEnabled(operation) {
+		return nil
+	}
+	return fmt.Errorf("no such file: %s/%s", queueName, operation)
 }
 
 func (qfs *queueFS) Create(path string) error {
@@ -529,6 +556,9 @@ func (qfs *queueFS) Read(path string, offset int64, size int64) ([]byte, error) 
 	if operation == "" {
 		return nil, fmt.Errorf("no such file: %s", path)
 	}
+	if !qfs.isOperationEnabled(operation) {
+		return nil, fmt.Errorf("no such file: %s", path)
+	}
 
 	var data []byte
 
@@ -539,7 +569,9 @@ func (qfs *queueFS) Read(path string, offset int64, size int64) ([]byte, error) 
 		data, err = qfs.peek(queueName)
 	case "size":
 		data, err = qfs.size(queueName)
-	case "enqueue", "clear":
+	case "stats":
+		data, err = qfs.stats(queueName)
+	case "enqueue", "clear", "ack", "nack", "recover":
 		// Write-only files
 		return []byte(""), fmt.Errorf("permission denied: %s is write-only", path)
 	default:
@@ -566,6 +598,9 @@ func (qfs *queueFS) Write(path string, data []byte, offset int64, flags filesyst
 	if operation == "" {
 		return 0, fmt.Errorf("cannot write to: %s", path)
 	}
+	if !qfs.isOperationEnabled(operation) {
+		return 0, fmt.Errorf("cannot write to: %s", path)
+	}
 
 	// QueueFS is append-only for enqueue, offset is ignored
 	switch operation {
@@ -582,7 +617,22 @@ func (qfs *queueFS) Write(path string, data []byte, offset int64, flags filesyst
 		if err := qfs.clear(queueName); err != nil {
 			return 0, err
 		}
-		return 0, nil
+		return int64(len(data)), nil
+	case "ack":
+		if err := qfs.ack(queueName, data); err != nil {
+			return 0, err
+		}
+		return int64(len(data)), nil
+	case "nack":
+		if err := qfs.nack(queueName, data); err != nil {
+			return 0, err
+		}
+		return int64(len(data)), nil
+	case "recover":
+		if _, err := qfs.recover(queueName); err != nil {
+			return 0, err
+		}
+		return int64(len(data)), nil
 	default:
 		return 0, fmt.Errorf("cannot write to: %s", path)
 	}
@@ -650,32 +700,23 @@ func (qfs *queueFS) ReadDir(path string) ([]filesystem.FileInfo, error) {
 	qfs.plugin.mu.RLock()
 	defer qfs.plugin.mu.RUnlock()
 
-	// Check if queue has messages
-	size, err := qfs.plugin.backend.Size(queueName)
+	queueExists, err := qfs.plugin.backend.QueueExists(queueName)
 	if err != nil {
 		return nil, err
 	}
 
-	if size > 0 {
-		// This is an actual queue with messages - return control files
-		return qfs.getQueueControlFiles(queueName, now)
-	}
-
-	// Check for nested queues
 	queues, err := qfs.plugin.backend.ListQueues(queueName)
 	if err != nil {
 		return nil, err
 	}
 
 	subdirs := make(map[string]bool)
-	hasNested := false
 
 	for _, qName := range queues {
 		if qName == queueName {
 			continue
 		}
 		if strings.HasPrefix(qName, queueName+"/") {
-			hasNested = true
 			remainder := strings.TrimPrefix(qName, queueName+"/")
 			parts := strings.Split(remainder, "/")
 			if len(parts) > 0 {
@@ -684,13 +725,18 @@ func (qfs *queueFS) ReadDir(path string) ([]filesystem.FileInfo, error) {
 		}
 	}
 
-	if !hasNested {
-		// No messages and no nested queues - treat as empty queue directory
-		return qfs.getQueueControlFiles(queueName, now)
+	var files []filesystem.FileInfo
+	if queueExists {
+		files, err = qfs.getQueueControlFiles(queueName, now)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	// Return subdirectories
-	var files []filesystem.FileInfo
+	if !queueExists && len(subdirs) == 0 {
+		return nil, fmt.Errorf("no such file or directory: %s", path)
+	}
+
 	for subdir := range subdirs {
 		files = append(files, filesystem.FileInfo{
 			Name:    subdir,
@@ -759,6 +805,48 @@ func (qfs *queueFS) getQueueControlFiles(queueName string, now time.Time) ([]fil
 			IsDir:   false,
 			Meta:    filesystem.MetaData{Name: PluginName, Type: MetaValueQueueControl},
 		},
+	}
+
+	if qfs.plugin.cfg.Mode == QueueModeTask {
+		statsBytes, err := qfs.stats(queueName)
+		if err != nil {
+			return nil, err
+		}
+
+		files = append(files,
+			filesystem.FileInfo{
+				Name:    "stats",
+				Size:    int64(len(statsBytes)),
+				Mode:    0444,
+				ModTime: now,
+				IsDir:   false,
+				Meta:    filesystem.MetaData{Name: PluginName, Type: MetaValueQueueStatus},
+			},
+			filesystem.FileInfo{
+				Name:    "ack",
+				Size:    0,
+				Mode:    0222,
+				ModTime: now,
+				IsDir:   false,
+				Meta:    filesystem.MetaData{Name: PluginName, Type: MetaValueQueueControl},
+			},
+			filesystem.FileInfo{
+				Name:    "nack",
+				Size:    0,
+				Mode:    0222,
+				ModTime: now,
+				IsDir:   false,
+				Meta:    filesystem.MetaData{Name: PluginName, Type: MetaValueQueueControl},
+			},
+			filesystem.FileInfo{
+				Name:    "recover",
+				Size:    0,
+				Mode:    0222,
+				ModTime: now,
+				IsDir:   false,
+				Meta:    filesystem.MetaData{Name: PluginName, Type: MetaValueQueueControl},
+			},
+		)
 	}
 
 	return files, nil
@@ -852,9 +940,12 @@ func (qfs *queueFS) Stat(path string) (*filesystem.FileInfo, error) {
 	if operation == "" {
 		return nil, fmt.Errorf("no such file: %s", path)
 	}
+	if !qfs.isOperationEnabled(operation) {
+		return nil, fmt.Errorf("no such file: %s", path)
+	}
 
 	mode := uint32(0644)
-	if operation == "enqueue" || operation == "clear" {
+	if operation == "enqueue" || operation == "clear" || operation == "ack" || operation == "nack" || operation == "recover" {
 		mode = 0222
 	} else {
 		mode = 0444
@@ -868,6 +959,12 @@ func (qfs *queueFS) Stat(path string) (*filesystem.FileInfo, error) {
 		fileType = MetaValueQueueStatus
 		queueSize, _ := qfs.plugin.backend.Size(queueName)
 		size = int64(len(strconv.Itoa(queueSize)))
+	} else if operation == "stats" {
+		fileType = MetaValueQueueStatus
+		statsBytes, err := qfs.stats(queueName)
+		if err == nil {
+			size = int64(len(statsBytes))
+		}
 	} else if operation == "peek" {
 		// Use last enqueue time for peek's ModTime
 		lastEnqueueTime, err := qfs.plugin.backend.GetLastEnqueueTime(queueName)
@@ -1008,6 +1105,53 @@ func (qfs *queueFS) size(queueName string) ([]byte, error) {
 	return []byte(strconv.Itoa(count)), nil
 }
 
+func (qfs *queueFS) stats(queueName string) ([]byte, error) {
+	qfs.plugin.mu.RLock()
+	defer qfs.plugin.mu.RUnlock()
+
+	stats, err := qfs.plugin.backend.Stats(queueName)
+	if err != nil {
+		return nil, err
+	}
+
+	return json.Marshal(stats)
+}
+
+func (qfs *queueFS) ack(queueName string, data []byte) error {
+	qfs.plugin.mu.Lock()
+	defer qfs.plugin.mu.Unlock()
+
+	payload, err := parseAckPayload(data)
+	if err != nil {
+		return err
+	}
+	return qfs.plugin.backend.Ack(queueName, payload.ID)
+}
+
+func (qfs *queueFS) nack(queueName string, data []byte) error {
+	qfs.plugin.mu.Lock()
+	defer qfs.plugin.mu.Unlock()
+
+	payload, err := parseNackPayload(data)
+	if err != nil {
+		return err
+	}
+	return qfs.plugin.backend.Nack(
+		queueName,
+		payload.ID,
+		payload.Error,
+		payload.Retry,
+		time.Duration(payload.RetryAfterSeconds)*time.Second,
+	)
+}
+
+func (qfs *queueFS) recover(queueName string) (int, error) {
+	qfs.plugin.mu.Lock()
+	defer qfs.plugin.mu.Unlock()
+
+	return qfs.plugin.backend.RecoverStale(queueName, time.Now().UTC())
+}
+
 func (qfs *queueFS) clear(queueName string) error {
 	qfs.plugin.mu.Lock()
 	defer qfs.plugin.mu.Unlock()
@@ -1030,13 +1174,19 @@ type queueFileHandle struct {
 	qfs       *queueFS
 	path      string
 	queueName string
-	operation string // "enqueue", "dequeue", "peek", "size", "clear"
+	operation string // "enqueue", "dequeue", "peek", "size", "stats", "ack", "nack", "recover", "clear"
 	flags     filesystem.OpenFlag
 
 	// For dequeue/peek: cached message data (read once, return from cache)
 	readBuffer []byte
 	readDone   bool
 	readPos    int64 // Current position for sequential Read() calls
+
+	// For write control files: buffer the full payload and commit once on Sync/Close
+	// so partial writes do not trigger side effects early.
+	writeBuffer    bytes.Buffer
+	writeDirty     bool
+	writeCommitted bool
 
 	mu sync.Mutex
 }
@@ -1070,7 +1220,7 @@ func (qfs *queueFS) OpenHandle(path string, flags filesystem.OpenFlag, mode uint
 	}
 
 	// Validate operation
-	if !queueOperations[operation] {
+	if !qfs.isOperationEnabled(operation) {
 		return nil, fmt.Errorf("unknown operation: %s", operation)
 	}
 
@@ -1108,16 +1258,12 @@ func (qfs *queueFS) GetHandle(id int64) (filesystem.FileHandle, error) {
 // CloseHandle closes a handle by its ID
 func (qfs *queueFS) CloseHandle(id int64) error {
 	queueHandleManager.mu.Lock()
-	defer queueHandleManager.mu.Unlock()
-
 	handle, ok := queueHandleManager.handles[id]
+	queueHandleManager.mu.Unlock()
 	if !ok {
 		return filesystem.ErrNotFound
 	}
-
-	delete(queueHandleManager.handles, id)
-	_ = handle // Clear reference
-	return nil
+	return handle.Close()
 }
 
 // ============================================================================
@@ -1152,7 +1298,9 @@ func (h *queueFileHandle) Read(buf []byte) (int, error) {
 			data, err = h.qfs.peek(h.queueName)
 		case "size":
 			data, err = h.qfs.size(h.queueName)
-		case "enqueue", "clear":
+		case "stats":
+			data, err = h.qfs.stats(h.queueName)
+		case "enqueue", "clear", "ack", "nack", "recover":
 			// These are write-only operations
 			return 0, io.EOF
 		default:
@@ -1193,7 +1341,9 @@ func (h *queueFileHandle) ReadAt(buf []byte, offset int64) (int, error) {
 			data, err = h.qfs.peek(h.queueName)
 		case "size":
 			data, err = h.qfs.size(h.queueName)
-		case "enqueue", "clear":
+		case "stats":
+			data, err = h.qfs.stats(h.queueName)
+		case "enqueue", "clear", "ack", "nack", "recover":
 			// These are write-only operations
 			return 0, io.EOF
 		default:
@@ -1226,19 +1376,18 @@ func (h *queueFileHandle) WriteAt(data []byte, offset int64) (int, error) {
 	defer h.mu.Unlock()
 
 	switch h.operation {
-	case "enqueue":
-		_, err := h.qfs.enqueue(h.queueName, data)
-		if err != nil {
+	case "enqueue", "ack", "nack":
+		if _, err := h.writeBuffer.Write(data); err != nil {
 			return 0, err
 		}
+		h.writeDirty = true
+		h.writeCommitted = false
 		return len(data), nil
-	case "clear":
-		err := h.qfs.clear(h.queueName)
-		if err != nil {
-			return 0, err
-		}
+	case "clear", "recover":
+		h.writeDirty = true
+		h.writeCommitted = false
 		return len(data), nil
-	case "dequeue", "peek", "size":
+	case "dequeue", "peek", "size", "stats":
 		return 0, fmt.Errorf("cannot write to %s", h.operation)
 	default:
 		return 0, fmt.Errorf("unsupported write operation: %s", h.operation)
@@ -1252,15 +1401,51 @@ func (h *queueFileHandle) Seek(offset int64, whence int) (int64, error) {
 }
 
 func (h *queueFileHandle) Sync() error {
-	// Nothing to sync for queue operations
-	return nil
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.flushWriteLocked()
 }
 
 func (h *queueFileHandle) Close() error {
+	h.mu.Lock()
+	err := h.flushWriteLocked()
+	h.mu.Unlock()
+	if err != nil {
+		return err
+	}
+
 	queueHandleManager.mu.Lock()
 	defer queueHandleManager.mu.Unlock()
 
 	delete(queueHandleManager.handles, h.id)
+	return nil
+}
+
+func (h *queueFileHandle) flushWriteLocked() error {
+	if h.writeCommitted || !h.writeDirty {
+		return nil
+	}
+
+	var err error
+	switch h.operation {
+	case "enqueue":
+		_, err = h.qfs.enqueue(h.queueName, h.writeBuffer.Bytes())
+	case "ack":
+		err = h.qfs.ack(h.queueName, h.writeBuffer.Bytes())
+	case "nack":
+		err = h.qfs.nack(h.queueName, h.writeBuffer.Bytes())
+	case "clear":
+		err = h.qfs.clear(h.queueName)
+	case "recover":
+		_, err = h.qfs.recover(h.queueName)
+	}
+	if err != nil {
+		return err
+	}
+
+	h.writeDirty = false
+	h.writeCommitted = true
+	h.writeBuffer.Reset()
 	return nil
 }
 
