@@ -398,6 +398,9 @@ func (b *Backend) ListQueues(prefix string) ([]string, error) {
 		}
 		queues = append(queues, qName)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate queue rows: %w", err)
+	}
 
 	return queues, nil
 }
