@@ -4,7 +4,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/c4pt0r/agfs/agfs-server/pkg/plugins/queuefs/internal/model"
+	model "github.com/c4pt0r/agfs/agfs-server/pkg/plugins/queuefs/internal"
 )
 
 // Queue represents a single message queue for the memory backend.

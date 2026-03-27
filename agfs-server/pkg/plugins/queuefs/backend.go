@@ -1,6 +1,6 @@
 package queuefs
 
-import "github.com/c4pt0r/agfs/agfs-server/pkg/plugins/queuefs/internal/model"
+import model "github.com/c4pt0r/agfs/agfs-server/pkg/plugins/queuefs/internal"
 
 // QueueBackend remains exported from the root package for compatibility.
 type QueueBackend = model.QueueBackend
