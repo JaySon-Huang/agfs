@@ -233,6 +233,11 @@ type SQLQueueBackend struct {
 	cacheMu     sync.RWMutex      // protects tableCache
 }
 
+type queueDeleteTarget struct {
+	queueName string
+	tableName string
+}
+
 func newSQLQueueBackend(backendType string, backend DBBackend) *SQLQueueBackend {
 	return &SQLQueueBackend{
 		backendType: backendType,
@@ -365,6 +370,48 @@ func (b *SQLQueueBackend) invalidateCache(queueName string) {
 	b.cacheMu.Lock()
 	delete(b.tableCache, queueName)
 	b.cacheMu.Unlock()
+}
+
+func (b *SQLQueueBackend) dropQueueTables(targets []queueDeleteTarget) ([]queueDeleteTarget, error) {
+	var dropped []queueDeleteTarget
+	var firstErr error
+	failed := 0
+
+	for _, q := range targets {
+		dropSQL := fmt.Sprintf("DROP TABLE IF EXISTS %s", q.tableName)
+		if _, err := b.db.Exec(dropSQL); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("failed to drop queue table %q: %w", q.tableName, err)
+			}
+			failed++
+			continue
+		}
+		log.Infof("[queuefs] Dropped queue table '%s' for queue '%s'", q.tableName, q.queueName)
+		dropped = append(dropped, q)
+	}
+
+	if firstErr != nil {
+		return dropped, fmt.Errorf("failed to drop %d of %d queue tables: %w", failed, len(targets), firstErr)
+	}
+	return dropped, nil
+}
+
+func (b *SQLQueueBackend) deleteRegistryEntries(targets []queueDeleteTarget) error {
+	for _, q := range targets {
+		if _, err := b.db.Exec(
+			b.rebind("DELETE FROM queuefs_registry WHERE queue_name = ?"),
+			q.queueName,
+		); err != nil {
+			return fmt.Errorf("failed to remove queue %q from registry: %w", q.queueName, err)
+		}
+	}
+	return nil
+}
+
+func (b *SQLQueueBackend) invalidateQueueCaches(targets []queueDeleteTarget) {
+	for _, q := range targets {
+		b.invalidateCache(q.queueName)
+	}
 }
 
 func (b *SQLQueueBackend) Enqueue(queueName string, msg QueueMessage) error {
@@ -603,40 +650,25 @@ func (b *SQLQueueBackend) RemoveQueue(queueName string) error {
 		}
 		defer rows.Close()
 
-		var queuesToDelete []struct {
-			queueName string
-			tableName string
-		}
+		var queuesToDelete []queueDeleteTarget
 
 		for rows.Next() {
 			var qName, tName string
 			if err := rows.Scan(&qName, &tName); err != nil {
 				return fmt.Errorf("failed to scan queue: %w", err)
 			}
-			queuesToDelete = append(queuesToDelete, struct {
-				queueName string
-				tableName string
-			}{qName, tName})
+			queuesToDelete = append(queuesToDelete, queueDeleteTarget{qName, tName})
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("failed to iterate queues: %w", err)
 		}
 
-		// Drop all tables before clearing registry/cache. If any drop fails, keep
-		// the registry as the source of truth so later operations can still find
-		// the surviving tables instead of leaving them orphaned.
-		for _, q := range queuesToDelete {
-			dropSQL := fmt.Sprintf("DROP TABLE IF EXISTS %s", q.tableName)
-			if _, err := b.db.Exec(dropSQL); err != nil {
-				return fmt.Errorf("failed to drop queue table %q: %w", q.tableName, err)
-			}
+		dropped, dropErr := b.dropQueueTables(queuesToDelete)
+		if err := b.deleteRegistryEntries(dropped); err != nil {
+			return err
 		}
-
-		// Clear cache completely
-		b.cacheMu.Lock()
-		b.tableCache = make(map[string]string)
-		b.cacheMu.Unlock()
-
-		// Clear registry
-		_, err = b.db.Exec("DELETE FROM queuefs_registry")
-		return err
+		b.invalidateQueueCaches(dropped)
+		return dropErr
 	}
 
 	// Remove queue and nested queues
@@ -649,45 +681,25 @@ func (b *SQLQueueBackend) RemoveQueue(queueName string) error {
 	}
 	defer rows.Close()
 
-	var queuesToDelete []struct {
-		queueName string
-		tableName string
-	}
+	var queuesToDelete []queueDeleteTarget
 
 	for rows.Next() {
 		var qName, tName string
 		if err := rows.Scan(&qName, &tName); err != nil {
 			return fmt.Errorf("failed to scan queue: %w", err)
 		}
-		queuesToDelete = append(queuesToDelete, struct {
-			queueName string
-			tableName string
-		}{qName, tName})
+		queuesToDelete = append(queuesToDelete, queueDeleteTarget{qName, tName})
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("failed to iterate queues: %w", err)
 	}
 
-	// Drop all target tables before mutating registry/cache. If any drop fails,
-	// preserve the registry entries so queue metadata stays aligned with the
-	// surviving physical tables.
-	for _, q := range queuesToDelete {
-		dropSQL := fmt.Sprintf("DROP TABLE IF EXISTS %s", q.tableName)
-		if _, err := b.db.Exec(dropSQL); err != nil {
-			return fmt.Errorf("failed to drop queue table %q: %w", q.tableName, err)
-		} else {
-			log.Infof("[queuefs] Dropped queue table '%s' for queue '%s'", q.tableName, q.queueName)
-		}
+	dropped, dropErr := b.dropQueueTables(queuesToDelete)
+	if err := b.deleteRegistryEntries(dropped); err != nil {
+		return err
 	}
-
-	for _, q := range queuesToDelete {
-		// Invalidate cache for this queue
-		b.invalidateCache(q.queueName)
-	}
-
-	// Remove from registry
-	_, err = b.db.Exec(
-		b.rebind("DELETE FROM queuefs_registry WHERE queue_name = ? OR queue_name LIKE ?"),
-		queueName, queueName+"/%",
-	)
-	return err
+	b.invalidateQueueCaches(dropped)
+	return dropErr
 }
 
 func (b *SQLQueueBackend) CreateQueue(queueName string) error {
