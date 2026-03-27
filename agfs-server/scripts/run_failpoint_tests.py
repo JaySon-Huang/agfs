@@ -41,6 +41,7 @@ def main() -> int:
         print("no *_failpoint_test.go files found", file=sys.stderr)
         return 1
 
+    exit_code = 0
     try:
         # Enable failpoint rewriting for the whole repo before running any test,
         # failpoint tests run in an instrumented tree.
@@ -51,11 +52,13 @@ def main() -> int:
                 ["go", "test", "-v", "-tags", "failpoint", pkg, "-run", pattern],
                 cwd=repo_root,
             )
+    except subprocess.CalledProcessError as exc:
+        exit_code = exc.returncode or 1
     finally:
         # Always restore the tree, even if discovery or a test run fails.
         subprocess.run([str(failpoint_ctl), "disable", "."], cwd=repo_root, check=False)
 
-    return 0
+    return exit_code
 
 
 def collect_failpoint_tests(repo_root: pathlib.Path) -> dict[str, set[str]]:
