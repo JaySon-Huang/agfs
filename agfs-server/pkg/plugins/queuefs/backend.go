@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pingcap/failpoint"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -376,12 +377,30 @@ func (b *SQLQueueBackend) dropQueueTables(targets []queueDeleteTarget) ([]queueD
 	var dropped []queueDeleteTarget
 	var firstErr error
 	failed := 0
+	dropAttempt := 0
 
 	for _, q := range targets {
+		dropAttempt++
 		dropSQL := fmt.Sprintf("DROP TABLE IF EXISTS %s", q.tableName)
-		if _, err := b.db.Exec(dropSQL); err != nil {
+		var dropErr error
+		failpoint.Inject("queuefsRemoveQueueDropError", func(val failpoint.Value) {
+			switch injected := val.(type) {
+			case int:
+				if dropAttempt == injected {
+					dropErr = fmt.Errorf("injected drop failure on attempt %d for %s", dropAttempt, q.tableName)
+				}
+			case string:
+				if injected == q.tableName || injected == q.queueName {
+					dropErr = fmt.Errorf("injected drop failure for %s", q.tableName)
+				}
+			}
+		})
+		if dropErr == nil {
+			_, dropErr = b.db.Exec(dropSQL)
+		}
+		if dropErr != nil {
 			if firstErr == nil {
-				firstErr = fmt.Errorf("failed to drop queue table %q: %w", q.tableName, err)
+				firstErr = fmt.Errorf("failed to drop queue table %q: %w", q.tableName, dropErr)
 			}
 			failed++
 			continue
