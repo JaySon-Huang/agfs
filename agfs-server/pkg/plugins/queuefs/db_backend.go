@@ -12,8 +12,9 @@ import (
 	"github.com/c4pt0r/agfs/agfs-server/pkg/plugin/config"
 	"github.com/go-sql-driver/mysql"
 	_ "github.com/go-sql-driver/mysql" // MySQL/TiDB driver
-	_ "github.com/jackc/pgx/v5/stdlib" // PostgreSQL driver
-	_ "github.com/mattn/go-sqlite3"    // SQLite driver
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
+	_ "github.com/mattn/go-sqlite3" // SQLite driver
 	log "github.com/sirupsen/logrus"
 )
 
@@ -295,6 +296,38 @@ func NewPostgreSQLDBBackend() *PostgreSQLDBBackend {
 	return &PostgreSQLDBBackend{}
 }
 
+func buildPostgresSSLMode(cfg map[string]interface{}) string {
+	if !config.GetBoolConfig(cfg, "enable_tls", false) {
+		return "disable"
+	}
+	if config.GetBoolConfig(cfg, "tls_skip_verify", false) {
+		return "require"
+	}
+	return "verify-full"
+}
+
+func applyPostgresTLSOverrides(connConfig *pgx.ConnConfig, cfg map[string]interface{}) {
+	if connConfig == nil || connConfig.TLSConfig == nil {
+		return
+	}
+
+	if serverName := config.GetStringConfig(cfg, "tls_server_name", ""); serverName != "" {
+		connConfig.TLSConfig.ServerName = serverName
+	}
+	if config.GetBoolConfig(cfg, "tls_skip_verify", false) {
+		connConfig.TLSConfig.InsecureSkipVerify = true
+	}
+}
+
+func registerPostgresConnString(dsn string, cfg map[string]interface{}) (string, *pgx.ConnConfig, error) {
+	connConfig, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return "", nil, err
+	}
+	applyPostgresTLSOverrides(connConfig, cfg)
+	return stdlib.RegisterConnConfig(connConfig), connConfig, nil
+}
+
 func (b *PostgreSQLDBBackend) Open(cfg map[string]interface{}) (*sql.DB, error) {
 	dsn := config.GetStringConfig(cfg, "dsn", "")
 	database := config.GetStringConfig(cfg, "database", "")
@@ -306,62 +339,69 @@ func (b *PostgreSQLDBBackend) Open(cfg map[string]interface{}) (*sql.DB, error) 
 		port := config.GetStringConfig(cfg, "port", "5432")
 		user := config.GetStringConfig(cfg, "user", "postgres")
 		password := config.GetStringConfig(cfg, "password", "")
-		sslMode := "disable"
-		if config.GetBoolConfig(cfg, "enable_tls", false) {
-			sslMode = "require"
-			if config.GetBoolConfig(cfg, "tls_skip_verify", false) {
-				sslMode = "prefer"
-			}
-		}
+		sslMode := buildPostgresSSLMode(cfg)
 
 		dsn = fmt.Sprintf("host=%s port=%s user=%s dbname=%s sslmode=%s",
 			host, port, user, database, sslMode)
 		if password != "" {
 			dsn += fmt.Sprintf(" password=%s", password)
 		}
-		if serverName := config.GetStringConfig(cfg, "tls_server_name", ""); serverName != "" {
-			dsn += fmt.Sprintf(" host=%s", serverName)
-		}
 	}
 
-	parsedDSN, err := url.Parse(dsn)
-	if err == nil {
+	parsedDSNURL, parseErr := url.Parse(dsn)
+	if parseErr == nil {
 		if database == "" {
-			database = strings.TrimPrefix(parsedDSN.Path, "/")
+			database = strings.TrimPrefix(parsedDSNURL.Path, "/")
 		}
 		if database == "" {
 			database = "postgres"
 		}
-		parsedDSN.Path = "/" + database
-		dsn = parsedDSN.String()
-	} else if database == "" {
+		parsedDSNURL.Path = "/" + database
+		dsn = parsedDSNURL.String()
+	}
+
+	targetDSN, targetConnConfig, err := registerPostgresConnString(dsn, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse PostgreSQL DSN: %w", err)
+	}
+	if database == "" {
+		database = targetConnConfig.Database
+	}
+	if database == "" {
 		database = "queuedb"
+		targetConnConfig.Database = database
+		targetDSN = stdlib.RegisterConnConfig(targetConnConfig)
 	}
 
 	adminDSN := config.GetStringConfig(cfg, "admin_dsn", "")
 	if adminDSN == "" && database != "" {
-		if parsedDSN != nil {
-			adminURL := *parsedDSN
-			adminURL.Path = "/postgres"
-			adminDSN = adminURL.String()
+		if targetConnConfig != nil {
+			adminConnConfig := *targetConnConfig
+			adminConnConfig.Database = "postgres"
+			adminDSN = stdlib.RegisterConnConfig(&adminConnConfig)
 		} else {
 			host := config.GetStringConfig(cfg, "host", "127.0.0.1")
 			port := config.GetStringConfig(cfg, "port", "5432")
 			user := config.GetStringConfig(cfg, "user", "postgres")
 			password := config.GetStringConfig(cfg, "password", "")
-			sslMode := "disable"
-			if config.GetBoolConfig(cfg, "enable_tls", false) {
-				sslMode = "require"
-				if config.GetBoolConfig(cfg, "tls_skip_verify", false) {
-					sslMode = "prefer"
-				}
-			}
+			sslMode := buildPostgresSSLMode(cfg)
 			adminDSN = fmt.Sprintf("host=%s port=%s user=%s dbname=postgres sslmode=%s",
 				host, port, user, sslMode)
 			if password != "" {
 				adminDSN += fmt.Sprintf(" password=%s", password)
 			}
+			registeredAdminDSN, _, err := registerPostgresConnString(adminDSN, cfg)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse PostgreSQL admin DSN: %w", err)
+			}
+			adminDSN = registeredAdminDSN
 		}
+	} else if adminDSN != "" {
+		registeredAdminDSN, _, err := registerPostgresConnString(adminDSN, cfg)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse PostgreSQL admin DSN: %w", err)
+		}
+		adminDSN = registeredAdminDSN
 	}
 
 	if adminDSN != "" && database != "" {
@@ -377,7 +417,7 @@ func (b *PostgreSQLDBBackend) Open(cfg map[string]interface{}) (*sql.DB, error) 
 		}
 	}
 
-	db, err := sql.Open("pgx", dsn)
+	db, err := sql.Open("pgx", targetDSN)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open PostgreSQL database: %w", err)
 	}
