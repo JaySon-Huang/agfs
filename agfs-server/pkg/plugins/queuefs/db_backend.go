@@ -479,6 +479,10 @@ func removeDatabaseFromDSN(dsn string) string {
 
 // sanitizeTableName converts a queue name to a safe table name
 // Replaces / with _ and ensures the name is safe for SQL
+// FIXME: This normalization is not collision-free. Distinct queue names such as
+// `a/b`, `a-b`, `a.b`, and `a_b` can collapse to the same physical table name,
+// which breaks the intended one-queue-to-one-table mapping recorded in
+// queuefs_registry.
 func sanitizeTableName(queueName string) string {
 	// Replace forward slashes with underscores
 	tableName := strings.ReplaceAll(queueName, "/", "_")

@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-func newSQLiteTestQueueFS(t *testing.T, dbPath string) *queueFS {
+func newSQLiteTestPlugin(t *testing.T, dbPath string) *QueueFSPlugin {
 	t.Helper()
 
 	plugin := NewQueueFSPlugin()
@@ -20,6 +20,13 @@ func newSQLiteTestQueueFS(t *testing.T, dbPath string) *queueFS {
 			_ = plugin.backend.Close()
 		}
 	})
+	return plugin
+}
+
+func newSQLiteTestQueueFS(t *testing.T, dbPath string) *queueFS {
+	t.Helper()
+
+	plugin := newSQLiteTestPlugin(t, dbPath)
 
 	fs, ok := plugin.GetFileSystem().(*queueFS)
 	if !ok {
