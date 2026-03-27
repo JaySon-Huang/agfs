@@ -50,13 +50,6 @@ type QueueFSPlugin struct {
 	metadata plugin.PluginMetadata
 }
 
-// Queue represents a single message queue (for memory backend)
-type Queue struct {
-	messages        []QueueMessage
-	mu              sync.Mutex
-	lastEnqueueTime time.Time // Tracks the timestamp of the most recently enqueued message
-}
-
 // NewQueueFSPlugin creates a new queue plugin
 func NewQueueFSPlugin() *QueueFSPlugin {
 	return &QueueFSPlugin{
