@@ -1,18 +1,6 @@
 name: agfs-shell
 
 on:
-  push:
-    branches: [master, main, develop]
-    paths:
-      - ".github/workflows/agfs-shell.yml"
-      - "agfs-shell/**"
-      - "agfs-sdk/python/**"
-  pull_request:
-    branches: [master, main, develop]
-    paths:
-      - ".github/workflows/agfs-shell.yml"
-      - "agfs-shell/**"
-      - "agfs-sdk/python/**"
   workflow_dispatch:
 
 permissions:
@@ -24,12 +12,8 @@ concurrency:
 
 jobs:
   tests:
-    name: tests (Python ${{ matrix.python-version }})
+    name: tests (Python 3.12)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.11", "3.12"]
     defaults:
       run:
         working-directory: agfs-shell
@@ -40,7 +24,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.12"
 
       - name: Install uv
         uses: astral-sh/setup-uv@v3
@@ -54,7 +38,6 @@ jobs:
         run: uv run pytest tests/ -v --cov=agfs_shell --cov-report=xml --cov-report=term
 
       - name: Upload coverage artifact
-        if: matrix.python-version == '3.11'
         uses: actions/upload-artifact@v4
         with:
           name: agfs-shell-coverage

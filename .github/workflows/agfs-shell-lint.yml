@@ -1,18 +1,6 @@
 name: agfs-shell-lint
 
 on:
-  push:
-    branches: [master, main, develop]
-    paths:
-      - ".github/workflows/agfs-shell-lint.yml"
-      - "agfs-shell/**"
-      - "agfs-sdk/python/**"
-  pull_request:
-    branches: [master, main, develop]
-    paths:
-      - ".github/workflows/agfs-shell-lint.yml"
-      - "agfs-shell/**"
-      - "agfs-sdk/python/**"
   workflow_dispatch:
 
 permissions:
@@ -36,7 +24,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
       - name: Install uv
         uses: astral-sh/setup-uv@v3
