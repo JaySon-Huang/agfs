@@ -34,7 +34,7 @@ func validateQueueFSConfig(cfg map[string]interface{}) error {
 
 	backendType := queueFSBackendType(cfg)
 	if !queueFSValidBackends[backendType] {
-		return fmt.Errorf("unsupported backend: %s (valid options: memory, tidb, mysql, pgsql, sqlite)", backendType)
+		return fmt.Errorf("unsupported backend: %s (valid options: memory, tidb/mysql, pgsql/postgres/postgresql, sqlite/sqlite3)", backendType)
 	}
 
 	if backendType == "memory" {
