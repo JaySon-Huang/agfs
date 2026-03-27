@@ -4,7 +4,6 @@ import (
 	"crypto/tls"
 	"database/sql"
 	"fmt"
-	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -346,18 +345,6 @@ func (b *PostgreSQLDBBackend) Open(cfg map[string]interface{}) (*sql.DB, error) 
 		if password != "" {
 			dsn += fmt.Sprintf(" password=%s", password)
 		}
-	}
-
-	parsedDSNURL, parseErr := url.Parse(dsn)
-	if parseErr == nil {
-		if database == "" {
-			database = strings.TrimPrefix(parsedDSNURL.Path, "/")
-		}
-		if database == "" {
-			database = "postgres"
-		}
-		parsedDSNURL.Path = "/" + database
-		dsn = parsedDSNURL.String()
 	}
 
 	targetDSN, targetConnConfig, err := registerPostgresConnString(dsn, cfg)
