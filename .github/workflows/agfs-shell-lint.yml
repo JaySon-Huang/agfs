@@ -1,0 +1,72 @@
+name: agfs-shell-lint
+
+on:
+  push:
+    branches: [master, main, develop]
+    paths:
+      - ".github/workflows/agfs-shell-lint.yml"
+      - "agfs-shell/**"
+      - "agfs-sdk/python/**"
+  pull_request:
+    branches: [master, main, develop]
+    paths:
+      - ".github/workflows/agfs-shell-lint.yml"
+      - "agfs-shell/**"
+      - "agfs-sdk/python/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agfs-shell-lint-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: lint (advisory)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agfs-shell
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: latest
+
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+
+      - name: Check code formatting with Black
+        run: uv run black --check agfs_shell/ tests/
+        continue-on-error: true
+
+      - name: Check import sorting with isort
+        run: uv run isort --check-only agfs_shell/ tests/
+        continue-on-error: true
+
+      - name: Lint with ruff
+        run: uv run ruff check agfs_shell/ tests/
+        continue-on-error: true
+
+      - name: Type check with mypy
+        run: uv run mypy agfs_shell/ --ignore-missing-imports
+        continue-on-error: true
+
+      - name: Publish advisory note
+        run: |
+          {
+            echo "## agfs-shell lint"
+            echo
+            echo "This workflow is advisory only and does not block PRs."
+            echo "Review the step logs above for any formatting, lint, or type-check findings."
+          } >> "$GITHUB_STEP_SUMMARY"
