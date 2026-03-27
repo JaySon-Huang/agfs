@@ -13,7 +13,6 @@ import (
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 	"github.com/c4pt0r/agfs/agfs-server/pkg/plugin"
-	"github.com/c4pt0r/agfs/agfs-server/pkg/plugin/config"
 	"github.com/google/uuid"
 	log "github.com/sirupsen/logrus"
 )
@@ -50,19 +49,6 @@ type QueueFSPlugin struct {
 	metadata plugin.PluginMetadata
 }
 
-// Queue represents a single message queue (for memory backend)
-type Queue struct {
-	messages        []QueueMessage
-	mu              sync.Mutex
-	lastEnqueueTime time.Time // Tracks the timestamp of the most recently enqueued message
-}
-
-type QueueMessage struct {
-	ID        string    `json:"id"`
-	Data      string    `json:"data"`
-	Timestamp time.Time `json:"timestamp"`
-}
-
 // NewQueueFSPlugin creates a new queue plugin
 func NewQueueFSPlugin() *QueueFSPlugin {
 	return &QueueFSPlugin{
@@ -80,79 +66,16 @@ func (q *QueueFSPlugin) Name() string {
 }
 
 func (q *QueueFSPlugin) Validate(cfg map[string]interface{}) error {
-	// Allowed configuration keys
-	allowedKeys := []string{
-		"backend", "mount_path",
-		// Database-related keys
-		"db_path", "dsn", "admin_dsn", "user", "password", "host", "port", "database",
-		"enable_tls", "tls_server_name", "tls_skip_verify",
-	}
-	if err := config.ValidateOnlyKnownKeys(cfg, allowedKeys); err != nil {
-		return err
-	}
-
-	// Validate backend type
-	backendType := config.GetStringConfig(cfg, "backend", "memory")
-	validBackends := map[string]bool{
-		"memory":     true,
-		"tidb":       true,
-		"mysql":      true,
-		"pgsql":      true,
-		"postgres":   true,
-		"postgresql": true,
-		"sqlite":     true,
-		"sqlite3":    true,
-	}
-	if !validBackends[backendType] {
-		return fmt.Errorf("unsupported backend: %s (valid options: memory, tidb, mysql, pgsql, sqlite)", backendType)
-	}
-
-	// Validate database-related parameters if backend is not memory
-	if backendType != "memory" {
-		for _, key := range []string{"db_path", "dsn", "admin_dsn", "user", "password", "host", "database", "tls_server_name"} {
-			if err := config.ValidateStringType(cfg, key); err != nil {
-				return err
-			}
-		}
-
-		for _, key := range []string{"port"} {
-			if err := config.ValidateIntType(cfg, key); err != nil {
-				return err
-			}
-		}
-
-		for _, key := range []string{"enable_tls", "tls_skip_verify"} {
-			if err := config.ValidateBoolType(cfg, key); err != nil {
-				return err
-			}
-		}
-	}
-
-	return nil
+	return validateQueueFSConfig(cfg)
 }
 
 func (q *QueueFSPlugin) Initialize(cfg map[string]interface{}) error {
-	backendType := config.GetStringConfig(cfg, "backend", "memory")
-
-	// Create appropriate backend
-	var backend QueueBackend
-	var err error
-
-	switch backendType {
-	case "memory":
-		backend = NewMemoryBackend()
-	case "sqlite", "sqlite3":
-		backend = NewSQLiteQueueBackend()
-	case "pgsql", "postgres", "postgresql":
-		backend = NewPostgresQueueBackend()
-	case "tidb", "mysql":
-		backend = NewTiDBQueueBackend()
-	default:
-		return fmt.Errorf("unsupported backend: %s", backendType)
+	backend, backendType, err := newQueueBackendFromConfig(cfg)
+	if err != nil {
+		return err
 	}
 
-	// Initialize backend
-	if err = backend.Initialize(cfg); err != nil {
+	if err := backend.Initialize(cfg); err != nil {
 		return fmt.Errorf("failed to initialize %s backend: %w", backendType, err)
 	}
 

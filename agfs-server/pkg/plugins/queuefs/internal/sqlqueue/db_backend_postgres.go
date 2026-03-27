@@ -1,4 +1,4 @@
-package queuefs
+package sqlqueue
 
 import (
 	"database/sql"
@@ -12,12 +12,9 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// PostgreSQLDBBackend implements DBBackend for PostgreSQL.
 type PostgreSQLDBBackend struct{}
 
-func NewPostgreSQLDBBackend() *PostgreSQLDBBackend {
-	return &PostgreSQLDBBackend{}
-}
+func NewPostgreSQLDBBackend() *PostgreSQLDBBackend { return &PostgreSQLDBBackend{} }
 
 func buildPostgresSSLMode(cfg map[string]interface{}) string {
 	if !config.GetBoolConfig(cfg, "enable_tls", false) {
@@ -33,7 +30,6 @@ func applyPostgresTLSOverrides(connConfig *pgx.ConnConfig, cfg map[string]interf
 	if connConfig == nil || connConfig.TLSConfig == nil {
 		return
 	}
-
 	if serverName := config.GetStringConfig(cfg, "tls_server_name", ""); serverName != "" {
 		connConfig.TLSConfig.ServerName = serverName
 	}
@@ -67,9 +63,7 @@ func (b *PostgreSQLDBBackend) Open(cfg map[string]interface{}) (*sql.DB, error) 
 		user := config.GetStringConfig(cfg, "user", "postgres")
 		password := config.GetStringConfig(cfg, "password", "")
 		sslMode := buildPostgresSSLMode(cfg)
-
-		dsn = fmt.Sprintf("host=%s port=%s user=%s dbname=%s sslmode=%s",
-			host, port, user, database, sslMode)
+		dsn = fmt.Sprintf("host=%s port=%s user=%s dbname=%s sslmode=%s", host, port, user, database, sslMode)
 		if password != "" {
 			dsn += fmt.Sprintf(" password=%s", password)
 		}
@@ -118,31 +112,24 @@ func (b *PostgreSQLDBBackend) Open(cfg map[string]interface{}) (*sql.DB, error) 
 	if err != nil {
 		return nil, fmt.Errorf("failed to open PostgreSQL database: %w", err)
 	}
-
 	db.SetMaxOpenConns(100)
 	db.SetMaxIdleConns(10)
-
 	if err := db.Ping(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to ping PostgreSQL database: %w", err)
 	}
-
 	return db, nil
 }
 
 func (b *PostgreSQLDBBackend) GetInitSQL() []string {
-	return []string{
-		`CREATE TABLE IF NOT EXISTS queuefs_registry (
+	return []string{`CREATE TABLE IF NOT EXISTS queuefs_registry (
 			queue_name TEXT PRIMARY KEY,
 			table_name TEXT NOT NULL,
 			created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-		)`,
-	}
+		)`}
 }
 
-func (b *PostgreSQLDBBackend) SupportsSkipLocked() bool {
-	return true
-}
+func (b *PostgreSQLDBBackend) SupportsSkipLocked() bool { return true }
 
 func (b *PostgreSQLDBBackend) QueueTableDDL(tableName string) string {
 	return fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
@@ -158,11 +145,7 @@ func (b *PostgreSQLDBBackend) QueueTableDDL(tableName string) string {
 
 func (b *PostgreSQLDBBackend) EnsureQueueIndexes(db *sql.DB, tableName string) error {
 	indexName := fmt.Sprintf("idx_%s_deleted_id", strings.TrimPrefix(tableName, "queuefs_queue_"))
-	indexSQL := fmt.Sprintf(
-		"CREATE INDEX IF NOT EXISTS %s ON %s(deleted, id)",
-		quotePostgresIdentifier(indexName),
-		tableName,
-	)
+	indexSQL := fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s ON %s(deleted, id)", quotePostgresIdentifier(indexName), tableName)
 	_, err := db.Exec(indexSQL)
 	if err != nil {
 		return fmt.Errorf("failed to create queue index: %w", err)
