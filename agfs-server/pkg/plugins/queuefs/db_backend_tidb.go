@@ -8,8 +8,7 @@ import (
 	"strings"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/plugin/config"
-	"github.com/go-sql-driver/mysql"
-	_ "github.com/go-sql-driver/mysql" // MySQL/TiDB driver
+	"github.com/go-sql-driver/mysql" // MySQL/TiDB driver
 	log "github.com/sirupsen/logrus"
 )
 
