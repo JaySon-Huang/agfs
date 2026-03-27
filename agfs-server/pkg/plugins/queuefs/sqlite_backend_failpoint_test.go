@@ -30,7 +30,7 @@ func TestQueueFSSQLiteRemoveQueuePartialFailureRegression(t *testing.T) {
 	// Inject a DROP TABLE failure on the second removal attempt so the test can
 	// verify partial-success handling deterministically without relying on backend-
 	// specific locking or permission behavior.
-	failpointPath := "github.com/c4pt0r/agfs/agfs-server/pkg/plugins/queuefs/queuefsRemoveQueueDropError"
+	failpointPath := "github.com/c4pt0r/agfs/agfs-server/pkg/plugins/queuefs/internal/sqlqueue/queuefsRemoveQueueDropError"
 	if err := failpoint.Enable(failpointPath, "return(2)"); err != nil {
 		t.Fatalf("enable failpoint: %v", err)
 	}
@@ -43,9 +43,8 @@ func TestQueueFSSQLiteRemoveQueuePartialFailureRegression(t *testing.T) {
 		t.Fatalf("RemoveQueue unexpectedly succeeded after enabling %s; expected injected DROP TABLE failure", failpointPath)
 	}
 
-	// Successful drops should be removed from both registry and cache, while the
-	// failed drop remains visible so queuefs_registry stays aligned with surviving
-	// physical tables.
+	// Successful drops should be removed from queuefs_registry while the failed
+	// drop remains visible so registry state stays aligned with surviving tables.
 	remaining := 0
 	for _, name := range []string{"jobs", "logs", "alerts"} {
 		exists, existsErr := backend.QueueExists(name)
@@ -54,13 +53,7 @@ func TestQueueFSSQLiteRemoveQueuePartialFailureRegression(t *testing.T) {
 		}
 		if exists {
 			remaining++
-			if _, ok := backend.tableCache[name]; !ok {
-				t.Fatalf("expected cache to retain failed queue %q", name)
-			}
 			continue
-		}
-		if _, ok := backend.tableCache[name]; ok {
-			t.Fatalf("expected cache entry for removed queue %q to be cleared", name)
 		}
 	}
 	if remaining != 1 {

@@ -1,4 +1,4 @@
-package queuefs
+package sqlqueue
 
 import (
 	"crypto/tls"
@@ -8,34 +8,24 @@ import (
 	"strings"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/plugin/config"
-	"github.com/go-sql-driver/mysql" // MySQL/TiDB driver
+	"github.com/go-sql-driver/mysql"
 	log "github.com/sirupsen/logrus"
 )
 
-// TiDBDBBackend implements DBBackend for TiDB and MySQL-compatible backends.
 type TiDBDBBackend struct{}
 
-func NewTiDBDBBackend() *TiDBDBBackend {
-	return &TiDBDBBackend{}
-}
+func NewTiDBDBBackend() *TiDBDBBackend { return &TiDBDBBackend{} }
 
 func (b *TiDBDBBackend) Open(cfg map[string]interface{}) (*sql.DB, error) {
-	// Check if DSN contains tls parameter.
 	dsnStr := config.GetStringConfig(cfg, "dsn", "")
 	dsnHasTLS := strings.Contains(dsnStr, "tls=")
-
-	// Register TLS configuration if needed.
 	enableTLS := config.GetBoolConfig(cfg, "enable_tls", false) || dsnHasTLS
 	tlsConfigName := "tidb-queuefs"
 
 	if enableTLS {
-		// Get TLS configuration.
 		serverName := config.GetStringConfig(cfg, "tls_server_name", "")
-
-		// If no explicit server name, try to extract from DSN or host.
 		if serverName == "" {
 			if dsnStr != "" {
-				// Extract host from DSN.
 				re := regexp.MustCompile(`@tcp\(([^:]+):\d+\)`)
 				if matches := re.FindStringSubmatch(dsnStr); len(matches) > 1 {
 					serverName = matches[1]
@@ -46,29 +36,20 @@ func (b *TiDBDBBackend) Open(cfg map[string]interface{}) (*sql.DB, error) {
 		}
 
 		skipVerify := config.GetBoolConfig(cfg, "tls_skip_verify", false)
-
-		tlsConfig := &tls.Config{
-			MinVersion: tls.VersionTLS12,
-		}
-
+		tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
 		if serverName != "" {
 			tlsConfig.ServerName = serverName
 		}
-
 		if skipVerify {
 			tlsConfig.InsecureSkipVerify = true
 			log.Warn("[queuefs] TLS certificate verification is disabled (insecure)")
 		}
-
-		// Register TLS config.
 		if err := mysql.RegisterTLSConfig(tlsConfigName, tlsConfig); err != nil {
 			log.Warnf("[queuefs] Failed to register TLS config (may already exist): %v", err)
 		}
 	}
 
-	// Build DSN.
 	var dsn string
-
 	if dsnStr != "" {
 		dsn = dsnStr
 	} else {
@@ -77,26 +58,18 @@ func (b *TiDBDBBackend) Open(cfg map[string]interface{}) (*sql.DB, error) {
 		host := config.GetStringConfig(cfg, "host", "127.0.0.1")
 		port := config.GetStringConfig(cfg, "port", "4000")
 		database := config.GetStringConfig(cfg, "database", "queuedb")
-
 		if password != "" {
-			dsn = fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?charset=utf8mb4&parseTime=True",
-				user, password, host, port, database)
+			dsn = fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?charset=utf8mb4&parseTime=True", user, password, host, port, database)
 		} else {
-			dsn = fmt.Sprintf("%s@tcp(%s:%s)/%s?charset=utf8mb4&parseTime=True",
-				user, host, port, database)
+			dsn = fmt.Sprintf("%s@tcp(%s:%s)/%s?charset=utf8mb4&parseTime=True", user, host, port, database)
 		}
-
 		if enableTLS {
 			dsn += fmt.Sprintf("&tls=%s", tlsConfigName)
 		}
 	}
 
 	log.Infof("[queuefs] Connecting to TiDB (TLS: %v)", enableTLS)
-
-	// Extract database name.
 	dbName := extractDatabaseName(dsn, config.GetStringConfig(cfg, "database", ""))
-
-	// Create database if needed.
 	if dbName != "" {
 		dsnWithoutDB := removeDatabaseFromDSN(dsn)
 		if dsnWithoutDB != dsn {
@@ -117,34 +90,24 @@ func (b *TiDBDBBackend) Open(cfg map[string]interface{}) (*sql.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to open TiDB database: %w", err)
 	}
-
-	// Set connection pool parameters.
 	db.SetMaxOpenConns(100)
 	db.SetMaxIdleConns(10)
-
-	// Test connection.
 	if err := db.Ping(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to ping TiDB database: %w", err)
 	}
-
 	return db, nil
 }
 
 func (b *TiDBDBBackend) GetInitSQL() []string {
-	return []string{
-		// Queue registry table to track all queue tables.
-		`CREATE TABLE IF NOT EXISTS queuefs_registry (
+	return []string{`CREATE TABLE IF NOT EXISTS queuefs_registry (
 			queue_name VARCHAR(255) PRIMARY KEY,
 			table_name VARCHAR(255) NOT NULL,
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
-	}
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`}
 }
 
-func (b *TiDBDBBackend) SupportsSkipLocked() bool {
-	return true
-}
+func (b *TiDBDBBackend) SupportsSkipLocked() bool { return true }
 
 func (b *TiDBDBBackend) QueueTableDDL(tableName string) string {
 	return fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
@@ -159,18 +122,11 @@ func (b *TiDBDBBackend) QueueTableDDL(tableName string) string {
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`, tableName)
 }
 
-func (b *TiDBDBBackend) EnsureQueueIndexes(db *sql.DB, tableName string) error {
-	return nil
-}
-
+func (b *TiDBDBBackend) EnsureQueueIndexes(db *sql.DB, tableName string) error { return nil }
 func (b *TiDBDBBackend) RegistryInsertSQL() string {
 	return "INSERT IGNORE INTO queuefs_registry (queue_name, table_name) VALUES (?, ?)"
 }
-
-func (b *TiDBDBBackend) Rebind(query string) string {
-	return query
-}
-
+func (b *TiDBDBBackend) Rebind(query string) string { return query }
 func (b *TiDBDBBackend) BoolLiteral(value bool) string {
 	if value {
 		return "1"
