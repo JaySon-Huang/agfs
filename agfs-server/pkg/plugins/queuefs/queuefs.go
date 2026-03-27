@@ -57,12 +57,6 @@ type Queue struct {
 	lastEnqueueTime time.Time // Tracks the timestamp of the most recently enqueued message
 }
 
-type QueueMessage struct {
-	ID        string    `json:"id"`
-	Data      string    `json:"data"`
-	Timestamp time.Time `json:"timestamp"`
-}
-
 // NewQueueFSPlugin creates a new queue plugin
 func NewQueueFSPlugin() *QueueFSPlugin {
 	return &QueueFSPlugin{
