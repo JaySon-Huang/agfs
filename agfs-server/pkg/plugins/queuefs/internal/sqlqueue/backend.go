@@ -266,7 +266,7 @@ func (b *Backend) Dequeue(queueName string) (QueueMessage, bool, error) {
 		"SELECT id, data FROM %s WHERE deleted = %s ORDER BY id LIMIT 1",
 		tableName, b.boolLiteral(false),
 	)
-	if b.backend.SupportsSkipLocked() {
+	if b.backend != nil && b.backend.SupportsSkipLocked() {
 		querySQL += " FOR UPDATE SKIP LOCKED"
 	}
 	querySQL = b.rebind(querySQL)
