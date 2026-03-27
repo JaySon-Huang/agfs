@@ -325,6 +325,9 @@ func registerPostgresConnString(dsn string, cfg map[string]interface{}) (string,
 		return "", nil, err
 	}
 	applyPostgresTLSOverrides(connConfig, cfg)
+	// TODO: Replace RegisterConnConfig with a connector-based OpenDB path.
+	// This helper is called from Open(), and the registered configs currently
+	// stay in pgx's global registry for the lifetime of the process.
 	return stdlib.RegisterConnConfig(connConfig), connConfig, nil
 }
 
