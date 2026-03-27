@@ -363,27 +363,9 @@ func (b *PostgreSQLDBBackend) Open(cfg map[string]interface{}) (*sql.DB, error) 
 
 	adminDSN := config.GetStringConfig(cfg, "admin_dsn", "")
 	if adminDSN == "" && database != "" {
-		if targetConnConfig != nil {
-			adminConnConfig := *targetConnConfig
-			adminConnConfig.Database = "postgres"
-			adminDSN = stdlib.RegisterConnConfig(&adminConnConfig)
-		} else {
-			host := config.GetStringConfig(cfg, "host", "127.0.0.1")
-			port := config.GetStringConfig(cfg, "port", "5432")
-			user := config.GetStringConfig(cfg, "user", "postgres")
-			password := config.GetStringConfig(cfg, "password", "")
-			sslMode := buildPostgresSSLMode(cfg)
-			adminDSN = fmt.Sprintf("host=%s port=%s user=%s dbname=postgres sslmode=%s",
-				host, port, user, sslMode)
-			if password != "" {
-				adminDSN += fmt.Sprintf(" password=%s", password)
-			}
-			registeredAdminDSN, _, err := registerPostgresConnString(adminDSN, cfg)
-			if err != nil {
-				return nil, fmt.Errorf("failed to parse PostgreSQL admin DSN: %w", err)
-			}
-			adminDSN = registeredAdminDSN
-		}
+		adminConnConfig := *targetConnConfig
+		adminConnConfig.Database = "postgres"
+		adminDSN = stdlib.RegisterConnConfig(&adminConnConfig)
 	} else if adminDSN != "" {
 		registeredAdminDSN, _, err := registerPostgresConnString(adminDSN, cfg)
 		if err != nil {
