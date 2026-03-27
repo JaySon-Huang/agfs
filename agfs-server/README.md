@@ -271,6 +271,8 @@ All API endpoints are prefixed with `/api/v1/`.
 Tests defined in files ending with `*_failpoint_test.go` rely on [`pingcap/failpoint`](https://github.com/pingcap/failpoint).
 Run them through the failpoint instrumentation flow instead of plain `go test`.
 
+`make test` and `make test-failpoint` must not run concurrently. The failpoint flow rewrites the `agfs-server` source tree during instrumentation, so overlapping it with a normal test run can cause transient build failures or leave one run observing partially instrumented files.
+
 ```bash
 make test-failpoint
 ```
