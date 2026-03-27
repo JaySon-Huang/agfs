@@ -314,6 +314,7 @@ func applyPostgresTLSOverrides(connConfig *pgx.ConnConfig, cfg map[string]interf
 		connConfig.TLSConfig.ServerName = serverName
 	}
 	if config.GetBoolConfig(cfg, "tls_skip_verify", false) {
+		log.Warn("PostgreSQL backend: TLS certificate verification is disabled (tls_skip_verify=true); this is insecure and should not be used in production")
 		connConfig.TLSConfig.InsecureSkipVerify = true
 	}
 }
