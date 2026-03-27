@@ -31,6 +31,9 @@ func validateQueueFSConfig(cfg map[string]interface{}) error {
 	if err := config.ValidateOnlyKnownKeys(cfg, queueFSAllowedConfigKeys); err != nil {
 		return err
 	}
+	if err := config.ValidateStringType(cfg, "backend"); err != nil {
+		return err
+	}
 
 	backendType := queueFSBackendType(cfg)
 	if !queueFSValidBackends[backendType] {
