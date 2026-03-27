@@ -227,6 +227,11 @@ type TiDBBackend struct {
 	cacheMu     sync.RWMutex      // protects tableCache
 }
 
+type queueDeleteTarget struct {
+	queueName string
+	tableName string
+}
+
 func NewTiDBBackend() *TiDBBackend {
 	return &TiDBBackend{
 		tableCache: make(map[string]string),
@@ -316,6 +321,48 @@ func (b *TiDBBackend) invalidateCache(queueName string) {
 	b.cacheMu.Lock()
 	delete(b.tableCache, queueName)
 	b.cacheMu.Unlock()
+}
+
+func (b *TiDBBackend) dropQueueTables(targets []queueDeleteTarget) ([]queueDeleteTarget, error) {
+	var dropped []queueDeleteTarget
+	var firstErr error
+	failed := 0
+
+	for _, q := range targets {
+		dropSQL := fmt.Sprintf("DROP TABLE IF EXISTS %s", q.tableName)
+		if _, err := b.db.Exec(dropSQL); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("failed to drop queue table %q: %w", q.tableName, err)
+			}
+			failed++
+			continue
+		}
+		log.Infof("[queuefs] Dropped queue table '%s' for queue '%s'", q.tableName, q.queueName)
+		dropped = append(dropped, q)
+	}
+
+	if firstErr != nil {
+		return dropped, fmt.Errorf("failed to drop %d of %d queue tables: %w", failed, len(targets), firstErr)
+	}
+	return dropped, nil
+}
+
+func (b *TiDBBackend) deleteRegistryEntries(targets []queueDeleteTarget) error {
+	for _, q := range targets {
+		if _, err := b.db.Exec(
+			"DELETE FROM queuefs_registry WHERE queue_name = ?",
+			q.queueName,
+		); err != nil {
+			return fmt.Errorf("failed to remove queue %q from registry: %w", q.queueName, err)
+		}
+	}
+	return nil
+}
+
+func (b *TiDBBackend) invalidateQueueCaches(targets []queueDeleteTarget) {
+	for _, q := range targets {
+		b.invalidateCache(q.queueName)
+	}
 }
 
 func (b *TiDBBackend) Enqueue(queueName string, msg QueueMessage) error {
@@ -536,38 +583,25 @@ func (b *TiDBBackend) RemoveQueue(queueName string) error {
 		}
 		defer rows.Close()
 
-		var queuesToDelete []struct {
-			queueName string
-			tableName string
-		}
+		var queuesToDelete []queueDeleteTarget
 
 		for rows.Next() {
 			var qName, tName string
 			if err := rows.Scan(&qName, &tName); err != nil {
 				return fmt.Errorf("failed to scan queue: %w", err)
 			}
-			queuesToDelete = append(queuesToDelete, struct {
-				queueName string
-				tableName string
-			}{qName, tName})
+			queuesToDelete = append(queuesToDelete, queueDeleteTarget{qName, tName})
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("failed to iterate queues: %w", err)
 		}
 
-		// Drop all tables and clear cache
-		for _, q := range queuesToDelete {
-			dropSQL := fmt.Sprintf("DROP TABLE IF EXISTS %s", q.tableName)
-			if _, err := b.db.Exec(dropSQL); err != nil {
-				log.Warnf("[queuefs] Failed to drop table '%s': %v", q.tableName, err)
-			}
+		dropped, dropErr := b.dropQueueTables(queuesToDelete)
+		if err := b.deleteRegistryEntries(dropped); err != nil {
+			return err
 		}
-
-		// Clear cache completely
-		b.cacheMu.Lock()
-		b.tableCache = make(map[string]string)
-		b.cacheMu.Unlock()
-
-		// Clear registry
-		_, err = b.db.Exec("DELETE FROM queuefs_registry")
-		return err
+		b.invalidateQueueCaches(dropped)
+		return dropErr
 	}
 
 	// Remove queue and nested queues
@@ -580,40 +614,25 @@ func (b *TiDBBackend) RemoveQueue(queueName string) error {
 	}
 	defer rows.Close()
 
-	var queuesToDelete []struct {
-		queueName string
-		tableName string
-	}
+	var queuesToDelete []queueDeleteTarget
 
 	for rows.Next() {
 		var qName, tName string
 		if err := rows.Scan(&qName, &tName); err != nil {
 			return fmt.Errorf("failed to scan queue: %w", err)
 		}
-		queuesToDelete = append(queuesToDelete, struct {
-			queueName string
-			tableName string
-		}{qName, tName})
+		queuesToDelete = append(queuesToDelete, queueDeleteTarget{qName, tName})
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("failed to iterate queues: %w", err)
 	}
 
-	// Drop tables and invalidate cache
-	for _, q := range queuesToDelete {
-		dropSQL := fmt.Sprintf("DROP TABLE IF EXISTS %s", q.tableName)
-		if _, err := b.db.Exec(dropSQL); err != nil {
-			log.Warnf("[queuefs] Failed to drop table '%s': %v", q.tableName, err)
-		} else {
-			log.Infof("[queuefs] Dropped queue table '%s' for queue '%s'", q.tableName, q.queueName)
-		}
-		// Invalidate cache for this queue
-		b.invalidateCache(q.queueName)
+	dropped, dropErr := b.dropQueueTables(queuesToDelete)
+	if err := b.deleteRegistryEntries(dropped); err != nil {
+		return err
 	}
-
-	// Remove from registry
-	_, err = b.db.Exec(
-		"DELETE FROM queuefs_registry WHERE queue_name = ? OR queue_name LIKE ?",
-		queueName, queueName+"/%",
-	)
-	return err
+	b.invalidateQueueCaches(dropped)
+	return dropErr
 }
 
 func (b *TiDBBackend) CreateQueue(queueName string) error {
