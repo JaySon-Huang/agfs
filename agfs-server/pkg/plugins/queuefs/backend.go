@@ -219,6 +219,12 @@ func (b *MemoryBackend) QueueExists(queueName string) (bool, error) {
 }
 
 // SQLQueueBackend implements QueueBackend using a SQL database.
+// queuefs_registry is the logical source of truth for queue existence and
+// queue-to-table mapping; physical queue tables are addressed only through
+// registry/cache lookups rather than by scanning database objects directly.
+// TODO: tableCache is still treated as a local fast path in some code paths.
+// That can make cross-instance idempotent delete/recreate flows observe stale
+// queue metadata until the cache is refreshed from queuefs_registry.
 type SQLQueueBackend struct {
 	db          *sql.DB
 	backend     DBBackend
@@ -613,11 +619,13 @@ func (b *SQLQueueBackend) RemoveQueue(queueName string) error {
 			}{qName, tName})
 		}
 
-		// Drop all tables and clear cache
+		// Drop all tables before clearing registry/cache. If any drop fails, keep
+		// the registry as the source of truth so later operations can still find
+		// the surviving tables instead of leaving them orphaned.
 		for _, q := range queuesToDelete {
 			dropSQL := fmt.Sprintf("DROP TABLE IF EXISTS %s", q.tableName)
 			if _, err := b.db.Exec(dropSQL); err != nil {
-				log.Warnf("[queuefs] Failed to drop table '%s': %v", q.tableName, err)
+				return fmt.Errorf("failed to drop queue table %q: %w", q.tableName, err)
 			}
 		}
 
@@ -657,14 +665,19 @@ func (b *SQLQueueBackend) RemoveQueue(queueName string) error {
 		}{qName, tName})
 	}
 
-	// Drop tables and invalidate cache
+	// Drop all target tables before mutating registry/cache. If any drop fails,
+	// preserve the registry entries so queue metadata stays aligned with the
+	// surviving physical tables.
 	for _, q := range queuesToDelete {
 		dropSQL := fmt.Sprintf("DROP TABLE IF EXISTS %s", q.tableName)
 		if _, err := b.db.Exec(dropSQL); err != nil {
-			log.Warnf("[queuefs] Failed to drop table '%s': %v", q.tableName, err)
+			return fmt.Errorf("failed to drop queue table %q: %w", q.tableName, err)
 		} else {
 			log.Infof("[queuefs] Dropped queue table '%s' for queue '%s'", q.tableName, q.queueName)
 		}
+	}
+
+	for _, q := range queuesToDelete {
 		// Invalidate cache for this queue
 		b.invalidateCache(q.queueName)
 	}
@@ -681,6 +694,15 @@ func (b *SQLQueueBackend) CreateQueue(queueName string) error {
 	// Generate table name
 	tableName := sanitizeTableName(queueName)
 
+	// Table/index creation is intentionally idempotent via IF NOT EXISTS.
+	// We do not try to clean up partially-created database objects here: concurrent
+	// CreateQueue calls for the same queue name may share the same table/index, so
+	// a failing caller cannot safely tell whether it owns the objects it is about
+	// to drop. DDL auto-commit and locking behavior also differs across SQLite,
+	// TiDB/MySQL, and PostgreSQL, which makes rollback-style cleanup unreliable.
+	// Instead, if registry insertion fails after DDL succeeds, we allow an orphaned
+	// table to remain and rely on a later CreateQueue retry to register it and keep
+	// queue creation idempotent from the user's perspective.
 	// Create the queue table
 	createTableSQL := b.backend.QueueTableDDL(tableName)
 	if _, err := b.db.Exec(createTableSQL); err != nil {
