@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pingcap/failpoint"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -327,12 +328,30 @@ func (b *TiDBBackend) dropQueueTables(targets []queueDeleteTarget) ([]queueDelet
 	var dropped []queueDeleteTarget
 	var firstErr error
 	failed := 0
+	dropAttempt := 0
 
 	for _, q := range targets {
+		dropAttempt++
 		dropSQL := fmt.Sprintf("DROP TABLE IF EXISTS %s", q.tableName)
-		if _, err := b.db.Exec(dropSQL); err != nil {
+		var dropErr error
+		failpoint.Inject("queuefsRemoveQueueDropError", func(val failpoint.Value) {
+			switch injected := val.(type) {
+			case int:
+				if dropAttempt == injected {
+					dropErr = fmt.Errorf("injected drop failure on attempt %d for %s", dropAttempt, q.tableName)
+				}
+			case string:
+				if injected == q.tableName || injected == q.queueName {
+					dropErr = fmt.Errorf("injected drop failure for %s", q.tableName)
+				}
+			}
+		})
+		if dropErr == nil {
+			_, dropErr = b.db.Exec(dropSQL)
+		}
+		if dropErr != nil {
 			if firstErr == nil {
-				firstErr = fmt.Errorf("failed to drop queue table %q: %w", q.tableName, err)
+				firstErr = fmt.Errorf("failed to drop queue table %q: %w", q.tableName, dropErr)
 			}
 			failed++
 			continue
@@ -641,8 +660,19 @@ func (b *TiDBBackend) CreateQueue(queueName string) error {
 
 	// Create the queue table
 	createTableSQL := getCreateTableSQL(tableName)
-	if _, err := b.db.Exec(createTableSQL); err != nil {
-		return fmt.Errorf("failed to create queue table: %w", err)
+	skipCreateDDL := false
+	failpoint.Inject("queuefsSkipCreateQueueDDL", func() {
+		// TODO: upstream SQLite queue-table DDL is not yet compatible with the
+		// partial-removal failpoint regression path. This failpoint temporarily
+		// bypasses queue table creation so that the RemoveQueue metadata semantics
+		// can still be covered with a SQLite-backed plugin test. Replace this with
+		// a real SQLite queue-creation path once upstream SQLite support is fixed.
+		skipCreateDDL = true
+	})
+	if !skipCreateDDL {
+		if _, err := b.db.Exec(createTableSQL); err != nil {
+			return fmt.Errorf("failed to create queue table: %w", err)
+		}
 	}
 
 	// Register in queuefs_registry
