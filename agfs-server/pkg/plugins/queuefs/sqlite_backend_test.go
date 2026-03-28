@@ -179,7 +179,7 @@ func TestQueueFSSQLiteDurableLifecycle(t *testing.T) {
 	if err := json.Unmarshal(claimedBytes, &claimed); err != nil {
 		t.Fatalf("unmarshal durable sqlite claim: %v (payload=%q)", err, string(claimedBytes))
 	}
-	if got := string(claimed.Data); got != "sqlite-durable" {
+	if got := claimed.Data; got != "sqlite-durable" {
 		t.Fatalf("claimed durable sqlite data = %q, want sqlite-durable", got)
 	}
 

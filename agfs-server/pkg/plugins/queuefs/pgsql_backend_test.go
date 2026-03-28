@@ -412,7 +412,7 @@ func TestQueueFSPGSQLDurableLifecycle(t *testing.T) {
 	if err := json.Unmarshal(claimedBytes, &claimed); err != nil {
 		t.Fatalf("unmarshal durable pgsql claim: %v (payload=%q)", err, string(claimedBytes))
 	}
-	if got := string(claimed.Data); got != "pgsql-durable" {
+	if got := claimed.Data; got != "pgsql-durable" {
 		t.Fatalf("claimed durable pgsql data = %q, want pgsql-durable", got)
 	}
 	ackPayload := []byte(`{"message_id":"` + claimed.MessageID + `","receipt":"` + claimed.Receipt + `"}`)

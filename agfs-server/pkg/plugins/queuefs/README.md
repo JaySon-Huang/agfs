@@ -65,6 +65,8 @@ echo "" > /clear
 
 Durable claim/ack workflow:
 
+- The durable dequeue payload keeps `data` as the same plain string body used by the regular queue message JSON.
+
 ```bash
 # Enable durable mode in plugin config first.
 cat /dequeue

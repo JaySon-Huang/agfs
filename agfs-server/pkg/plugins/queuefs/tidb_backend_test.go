@@ -373,7 +373,7 @@ func TestQueueFSTiDBDurableLifecycle(t *testing.T) {
 	if err := json.Unmarshal(claimedBytes, &claimed); err != nil {
 		t.Fatalf("unmarshal durable tidb claim: %v (payload=%q)", err, string(claimedBytes))
 	}
-	if got := string(claimed.Data); got != "tidb-durable" {
+	if got := claimed.Data; got != "tidb-durable" {
 		t.Fatalf("claimed durable tidb data = %q, want tidb-durable", got)
 	}
 	ackPayload := []byte(`{"message_id":"` + claimed.MessageID + `","receipt":"` + claimed.Receipt + `"}`)

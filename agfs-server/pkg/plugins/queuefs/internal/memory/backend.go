@@ -265,7 +265,7 @@ func (b *Backend) Claim(queueName string, req model.ClaimRequest) (model.Claimed
 	return model.ClaimedMessage{
 		MessageID:  item.message.ID,
 		QueueName:  queueName,
-		Data:       []byte(item.message.Data),
+		Data:       item.message.Data,
 		Receipt:    receipt,
 		ClaimedAt:  claimedAt,
 		LeaseUntil: claimed.leaseUntil,

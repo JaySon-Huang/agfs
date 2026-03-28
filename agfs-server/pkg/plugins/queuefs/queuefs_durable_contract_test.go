@@ -36,7 +36,7 @@ func newDurableTestBackend() *durableTestBackend {
 		claimResponse: ClaimedMessage{
 			MessageID:  "claimed-1",
 			QueueName:  "jobs",
-			Data:       []byte("payload"),
+			Data:       "payload",
 			Receipt:    "receipt-1",
 			ClaimedAt:  now,
 			LeaseUntil: now.Add(30 * time.Second),
@@ -329,7 +329,7 @@ func TestQueueFSDurableMemoryLifecycle(t *testing.T) {
 	if err := json.Unmarshal(claimedBytes, &claimed); err != nil {
 		t.Fatalf("unmarshal durable claim: %v (payload=%q)", err, string(claimedBytes))
 	}
-	if got := string(claimed.Data); got != "first" {
+	if got := claimed.Data; got != "first" {
 		t.Fatalf("claimed data = %q, want first", got)
 	}
 	if claimed.Receipt == "" {

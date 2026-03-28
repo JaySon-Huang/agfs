@@ -78,10 +78,12 @@ type ClaimRequest struct {
 }
 
 // ClaimedMessage is the durable dequeue payload returned to workers.
+// Data intentionally follows the same string semantics as QueueMessage.Data so
+// fifo and durable dequeue APIs expose the message body consistently.
 type ClaimedMessage struct {
 	MessageID  string    `json:"message_id"`
 	QueueName  string    `json:"queue_name"`
-	Data       []byte    `json:"data"`
+	Data       string    `json:"data"`
 	Receipt    string    `json:"receipt"`
 	ClaimedAt  time.Time `json:"claimed_at"`
 	LeaseUntil time.Time `json:"lease_until"`

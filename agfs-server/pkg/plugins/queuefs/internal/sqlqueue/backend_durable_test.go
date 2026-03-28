@@ -47,7 +47,7 @@ func TestSQLiteBackendDurableLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("claim first message: %v", err)
 	}
-	if !found || claimed.MessageID != "first" || string(claimed.Data) != "first" || claimed.Attempt != 1 {
+	if !found || claimed.MessageID != "first" || claimed.Data != "first" || claimed.Attempt != 1 {
 		t.Fatalf("unexpected claim result: found=%v claimed=%+v", found, claimed)
 	}
 
