@@ -3,16 +3,18 @@ name: agfs-server ci
 on:
   push:
     branches: [master, main, develop]
-    paths:
-      - ".github/workflows/agfs-server.yml"
-      - "agfs-server/**"
-      - "agfs-sdk/go/**"
+    paths-ignore:
+      - "agfs-server/*.md"
+      - "agfs-server/**/*.md"
+      - "agfs-sdk/go/*.md"
+      - "agfs-sdk/go/**/*.md"
   pull_request:
     branches: [master, main, develop]
-    paths:
-      - ".github/workflows/agfs-server.yml"
-      - "agfs-server/**"
-      - "agfs-sdk/go/**"
+    paths-ignore:
+      - "agfs-server/*.md"
+      - "agfs-server/**/*.md"
+      - "agfs-sdk/go/*.md"
+      - "agfs-sdk/go/**/*.md"
   workflow_dispatch:
 
 permissions:
@@ -26,8 +28,33 @@ env:
   TIDB_VERSION: v8.5.5
 
 jobs:
+  changes:
+    name: detect agfs-server changes
+    runs-on: ubuntu-latest
+    outputs:
+      agfs_server: ${{ steps.filter.outputs.agfs_server }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Detect relevant non-doc changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            agfs_server:
+              - '.github/workflows/agfs-server.yml'
+              - 'agfs-server/**'
+              - 'agfs-sdk/go/**'
+              - '!agfs-server/*.md'
+              - '!agfs-server/**/*.md'
+              - '!agfs-sdk/go/*.md'
+              - '!agfs-sdk/go/**/*.md'
+
   tests:
     name: agfs-server unit tests
+    needs: changes
+    if: needs.changes.outputs.agfs_server == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -44,6 +71,8 @@ jobs:
 
   failpoint-tests:
     name: agfs-server failpoint and integration tests
+    needs: changes
+    if: needs.changes.outputs.agfs_server == 'true'
     runs-on: ubuntu-latest
     services:
       postgres:
