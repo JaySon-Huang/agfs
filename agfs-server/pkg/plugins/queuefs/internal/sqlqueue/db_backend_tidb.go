@@ -152,6 +152,9 @@ func (b *TiDBDBBackend) QueueTableDDL(tableName string) string {
 }
 
 func (b *TiDBDBBackend) EnsureQueueIndexes(db *sql.DB, tableName string) error {
+	// TODO(queuefs): re-check this migration path against real MySQL variants.
+	// TiDB accepts these IF NOT EXISTS forms, but backend=mysql currently reuses
+	// this adapter and may need narrower compatibility handling.
 	alterSQL := []string{
 		fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS attempt INT NOT NULL DEFAULT 0", tableName),
 		fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS recovery_count INT NOT NULL DEFAULT 0", tableName),

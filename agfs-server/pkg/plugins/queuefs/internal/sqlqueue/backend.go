@@ -761,6 +761,9 @@ func (b *Backend) RecoverExpired(queueName string, now time.Time, limit int) (in
 	recovered := 0
 	// Apply recovery row by row so the same code path works across SQLite,
 	// PostgreSQL, and TiDB without relying on dialect-specific bulk UPDATE syntax.
+	// TODO(queuefs): revisit this if recovery throughput becomes a bottleneck.
+	// A batched UPDATE may be faster, but it needs dialect-specific handling and
+	// careful verification across SQLite, PostgreSQL, TiDB, and future MySQL support.
 	for _, messageID := range messageIDs {
 		result, err := tx.Exec(updateSQL, messageID, now.Unix())
 		if err != nil {
