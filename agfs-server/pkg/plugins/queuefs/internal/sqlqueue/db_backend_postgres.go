@@ -12,8 +12,10 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+// PostgreSQLDBBackend adapts queuefs SQL operations to PostgreSQL.
 type PostgreSQLDBBackend struct{}
 
+// NewPostgreSQLDBBackend returns a PostgreSQL dialect adapter for queuefs.
 func NewPostgreSQLDBBackend() *PostgreSQLDBBackend { return &PostgreSQLDBBackend{} }
 
 func buildPostgresSSLMode(cfg map[string]interface{}) string {

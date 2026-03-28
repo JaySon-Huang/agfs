@@ -37,6 +37,7 @@ type queueDeleteTarget struct {
 	tableName string
 }
 
+// newBackend wires a SQL queue backend to an optional concrete DBBackend.
 func newBackend(backendType string, backend DBBackend) *Backend {
 	return &Backend{
 		backendType: backendType,
@@ -45,18 +46,23 @@ func newBackend(backendType string, backend DBBackend) *Backend {
 	}
 }
 
+// NewBackend returns a SQL-backed queue backend that resolves the concrete
+// database implementation from configuration at initialization time.
 func NewBackend() *Backend {
 	return newBackend("", nil)
 }
 
+// NewSQLiteBackend returns a queue backend pinned to the SQLite implementation.
 func NewSQLiteBackend() *Backend {
 	return newBackend("sqlite", NewSQLiteDBBackend())
 }
 
+// NewTiDBBackend returns a queue backend pinned to the TiDB implementation.
 func NewTiDBBackend() *Backend {
 	return newBackend("tidb", NewTiDBDBBackend())
 }
 
+// NewPostgresBackend returns a queue backend pinned to the PostgreSQL implementation.
 func NewPostgresBackend() *Backend {
 	return newBackend("pgsql", NewPostgreSQLDBBackend())
 }
@@ -130,10 +136,14 @@ func (b *Backend) boolLiteral(value bool) string {
 }
 
 func (b *Backend) pendingPredicate() string {
+	// Durable state is encoded inline on the queue row: pending rows have not
+	// been deleted and do not yet carry an active receipt.
 	return fmt.Sprintf("deleted = %s AND receipt IS NULL", b.boolLiteral(false))
 }
 
 func (b *Backend) processingPredicate() string {
+	// Claimed rows stay in the same table and flip into processing state by
+	// attaching a receipt/lease instead of moving to a side table.
 	return fmt.Sprintf("deleted = %s AND receipt IS NOT NULL", b.boolLiteral(false))
 }
 
@@ -585,6 +595,8 @@ func (b *Backend) Claim(queueName string, req model.ClaimRequest) (model.Claimed
 		tableName, b.pendingPredicate(),
 	)
 	if b.backend != nil && b.backend.SupportsSkipLocked() {
+		// Prefer SKIP LOCKED when available so concurrent claimers naturally spread
+		// across different rows instead of blocking one another.
 		querySQL += " FOR UPDATE SKIP LOCKED"
 	}
 	querySQL = b.rebind(querySQL)
@@ -608,6 +620,9 @@ func (b *Backend) Claim(queueName string, req model.ClaimRequest) (model.Claimed
 		tableName, b.pendingPredicate(),
 	)
 	updateSQL = b.rebind(updateSQL)
+	// The claim is finalized by a conditional row update in the same transaction.
+	// If another worker wins the race first, RowsAffected becomes zero and the
+	// caller simply observes an empty claim result.
 	result, err := tx.Exec(updateSQL, receipt, claimedAt.Unix(), leaseUntil.Unix(), attempt+1, id)
 	if err != nil {
 		return model.ClaimedMessage{}, false, fmt.Errorf("failed to claim message: %w", err)
@@ -715,6 +730,8 @@ func (b *Backend) RecoverExpired(queueName string, now time.Time, limit int) (in
 		args = append(args, limit)
 	}
 	if b.backend != nil && b.backend.SupportsSkipLocked() {
+		// Keep recovery non-blocking under concurrent claimers by skipping rows that
+		// another session already locked for claim/recovery work.
 		querySQL += " FOR UPDATE SKIP LOCKED"
 	}
 	querySQL = b.rebind(querySQL)
@@ -742,6 +759,8 @@ func (b *Backend) RecoverExpired(queueName string, now time.Time, limit int) (in
 	)
 	updateSQL = b.rebind(updateSQL)
 	recovered := 0
+	// Apply recovery row by row so the same code path works across SQLite,
+	// PostgreSQL, and TiDB without relying on dialect-specific bulk UPDATE syntax.
 	for _, messageID := range messageIDs {
 		result, err := tx.Exec(updateSQL, messageID, now.Unix())
 		if err != nil {

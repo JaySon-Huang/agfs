@@ -37,6 +37,7 @@ func quotePostgresIdentifier(identifier string) string {
 	return `"` + strings.ReplaceAll(identifier, `"`, `""`) + `"`
 }
 
+// CreateBackend returns the concrete SQL dialect adapter for queuefs.
 func CreateBackend(cfg map[string]interface{}) (DBBackend, error) {
 	backendType := config.GetStringConfig(cfg, "backend", "memory")
 

@@ -9,8 +9,10 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
+// SQLiteDBBackend adapts queuefs SQL operations to SQLite.
 type SQLiteDBBackend struct{}
 
+// NewSQLiteDBBackend returns a SQLite dialect adapter for queuefs.
 func NewSQLiteDBBackend() *SQLiteDBBackend {
 	return &SQLiteDBBackend{}
 }
@@ -84,6 +86,8 @@ func (b *SQLiteDBBackend) BoolLiteral(value bool) string {
 }
 
 func ensureSQLiteDurableColumns(db *sql.DB, tableName string) error {
+	// SQLite lacks ADD COLUMN IF NOT EXISTS on older deployments, so schema
+	// evolution inspects the table first and only applies missing durable fields.
 	rows, err := db.Query(fmt.Sprintf("PRAGMA table_info(%s)", tableName))
 	if err != nil {
 		return fmt.Errorf("failed to inspect queue table schema: %w", err)

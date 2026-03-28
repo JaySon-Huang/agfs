@@ -39,6 +39,7 @@ type Backend struct {
 	queues map[string]*Queue
 }
 
+// NewBackend returns an in-memory queue backend.
 func NewBackend() *Backend {
 	return &Backend{
 		queues: make(map[string]*Queue),
@@ -273,7 +274,7 @@ func (b *Backend) Claim(queueName string, req model.ClaimRequest) (model.Claimed
 }
 
 func (b *Backend) Ack(queueName string, messageID string, receipt string) error {
-	claimed, queue, err := b.requireClaim(queueName, messageID, receipt)
+	_, queue, err := b.requireClaim(queueName, messageID, receipt)
 	if err != nil {
 		return err
 	}
@@ -284,7 +285,6 @@ func (b *Backend) Ack(queueName string, messageID string, receipt string) error 
 		return fmt.Errorf("claim is no longer active for message %q", messageID)
 	}
 	delete(queue.processing, messageID)
-	_ = claimed
 	return nil
 }
 
@@ -300,6 +300,8 @@ func (b *Backend) Release(queueName string, messageID string, req model.ReleaseR
 		return fmt.Errorf("claim is no longer active for message %q", messageID)
 	}
 	delete(queue.processing, messageID)
+	// Requeue at the front so an explicit release preserves FIFO semantics for the
+	// message that was previously at the head of the queue.
 	queue.pending = append([]queueItem{claimed.item}, queue.pending...)
 	return nil
 }
@@ -333,6 +335,8 @@ func (b *Backend) RecoverExpired(queueName string, now time.Time, limit int) (in
 		toPrepend = append(toPrepend, item)
 		recovered++
 	}
+	// Reverse the prepend order so multiple recovered claims become pending again
+	// in the same FIFO order they originally occupied.
 	for i := len(toPrepend) - 1; i >= 0; i-- {
 		queue.pending = append([]queueItem{toPrepend[i]}, queue.pending...)
 	}
@@ -375,5 +379,7 @@ func (b *Backend) requireClaim(queueName string, messageID string, receipt strin
 	if claimed.receipt != receipt {
 		return claimedItem{}, nil, fmt.Errorf("invalid receipt for message %q", messageID)
 	}
+	// The caller re-locks the queue before mutating state and revalidates the
+	// claim, so this helper only performs the shared existence/receipt checks.
 	return claimed, queue, nil
 }

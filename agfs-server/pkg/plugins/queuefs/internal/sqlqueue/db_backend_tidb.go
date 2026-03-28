@@ -12,8 +12,10 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+// TiDBDBBackend adapts queuefs SQL operations to TiDB/MySQL-compatible syntax.
 type TiDBDBBackend struct{}
 
+// NewTiDBDBBackend returns a TiDB dialect adapter for queuefs.
 func NewTiDBDBBackend() *TiDBDBBackend { return &TiDBDBBackend{} }
 
 func (b *TiDBDBBackend) Open(cfg map[string]interface{}) (*sql.DB, error) {

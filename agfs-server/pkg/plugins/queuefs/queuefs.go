@@ -1122,6 +1122,8 @@ type durableRecoverRequest struct {
 }
 
 func parseDurableAckRequest(data []byte) (durableAckRequest, error) {
+	// Durable control files use small JSON payloads so the wire contract is stable
+	// across the AGFS shell, direct file writes, and future non-filesystem clients.
 	var req durableAckRequest
 	if err := json.Unmarshal(data, &req); err != nil {
 		return durableAckRequest{}, fmt.Errorf("invalid durable ack payload: %w", err)
@@ -1134,6 +1136,8 @@ func parseDurableAckRequest(data []byte) (durableAckRequest, error) {
 
 func parseDurableRecoverRequest(data []byte) (durableRecoverRequest, error) {
 	if len(bytes.TrimSpace(data)) == 0 {
+		// Treat an empty recover write as "use backend defaults" to keep the file
+		// interface ergonomic for manual operators.
 		return durableRecoverRequest{}, nil
 	}
 	var req durableRecoverRequest
