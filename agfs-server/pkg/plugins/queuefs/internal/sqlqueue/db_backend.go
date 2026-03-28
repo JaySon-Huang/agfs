@@ -37,6 +37,7 @@ func quotePostgresIdentifier(identifier string) string {
 	return `"` + strings.ReplaceAll(identifier, `"`, `""`) + `"`
 }
 
+// CreateBackend returns the concrete SQL dialect adapter for queuefs.
 func CreateBackend(cfg map[string]interface{}) (DBBackend, error) {
 	backendType := config.GetStringConfig(cfg, "backend", "memory")
 
@@ -44,6 +45,9 @@ func CreateBackend(cfg map[string]interface{}) (DBBackend, error) {
 	case "sqlite", "sqlite3":
 		return NewSQLiteDBBackend(), nil
 	case "tidb", "mysql":
+		// TODO(queuefs): split MySQL into its own dialect once we validate durable
+		// schema evolution on real MySQL versions. The current adapter uses TiDB-
+		// friendly DDL features such as IF NOT EXISTS that may not be portable.
 		return NewTiDBDBBackend(), nil
 	case "pgsql", "postgres", "postgresql":
 		return NewPostgreSQLDBBackend(), nil

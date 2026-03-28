@@ -18,7 +18,12 @@ import (
 )
 
 const (
-	PluginName = "queuefs" // Name of this plugin
+	PluginName       = "queuefs" // Name of this plugin
+	queueModeFIFO    = "fifo"
+	queueModeDurable = "durable"
+	// Keep the QueueFS default lease explicit at the filesystem layer so every
+	// durable backend observes the same claim behavior through /dequeue.
+	queueFSDurableDefaultLeaseDuration = 30 * time.Second
 )
 
 // Meta values for QueueFS plugin
@@ -45,6 +50,7 @@ const (
 //   - pgsql: PostgreSQL database storage
 type QueueFSPlugin struct {
 	backend  QueueBackend
+	mode     string
 	mu       sync.RWMutex // Protects backend operations
 	metadata plugin.PluginMetadata
 }
@@ -75,11 +81,20 @@ func (q *QueueFSPlugin) Initialize(cfg map[string]interface{}) error {
 		return err
 	}
 
+	mode := queueFSMode(cfg)
+
 	if err := backend.Initialize(cfg); err != nil {
 		return fmt.Errorf("failed to initialize %s backend: %w", backendType, err)
 	}
+	if mode == queueModeDurable {
+		if _, ok := backend.(DurableQueueBackend); !ok {
+			_ = backend.Close()
+			return fmt.Errorf("failed to initialize %s backend: durable mode requires DurableQueueBackend support", backendType)
+		}
+	}
 
 	q.backend = backend
+	q.mode = mode
 
 	log.Infof("[queuefs] Initialized with backend: %s", backendType)
 	return nil
@@ -100,10 +115,18 @@ STRUCTURE:
     README          - This documentation
     <queue_name>/   - A queue directory
       enqueue       - Write-only file to enqueue messages
-      dequeue       - Read-only file to dequeue messages
-      peek          - Read-only file to peek at next message
-      size          - Read-only file showing queue size
+      dequeue       - Read-only file to dequeue or claim a message
+      size          - Read-only file showing pending queue size
       clear         - Write-only file to clear all messages
+
+MODES:
+  fifo (default):
+      peek          - Read-only file to peek at next message
+
+  durable:
+      ack           - Write-only file to acknowledge a claimed message
+      recover       - Write-only file to recover expired claims
+      stats         - Read-only file showing pending/processing/recoveries
 
 WORKFLOW:
   1. Create a queue:
@@ -113,19 +136,22 @@ WORKFLOW:
      echo "your message" > /queuefs/my_queue/enqueue
 
   3. Dequeue messages:
-     cat /queuefs/my_queue/dequeue
+      cat /queuefs/my_queue/dequeue
 
   4. Check queue size:
-     cat /queuefs/my_queue/size
+      cat /queuefs/my_queue/size
 
-  5. Peek without removing:
-     cat /queuefs/my_queue/peek
+  5. Peek without removing (fifo mode):
+      cat /queuefs/my_queue/peek
 
-  6. Clear the queue:
-     echo "" > /queuefs/my_queue/clear
+  6. Acknowledge a durable claim (durable mode):
+     echo '{"message_id":"...","receipt":"..."}' > /queuefs/my_queue/ack
 
-  7. Delete the queue:
-     rm -rf /queuefs/my_queue
+  7. Clear the queue:
+      echo "" > /queuefs/my_queue/clear
+
+  8. Delete the queue:
+      rm -rf /queuefs/my_queue
 
 NESTED QUEUES:
   You can create queues in nested directories:
@@ -235,6 +261,13 @@ func (q *QueueFSPlugin) GetConfigParams() []plugin.ConfigParameter {
 			Description: "Queue backend (memory, tidb, mysql, pgsql, postgres, sqlite, sqlite3)",
 		},
 		{
+			Name:        "mode",
+			Type:        "string",
+			Required:    false,
+			Default:     queueModeFIFO,
+			Description: "Queue contract mode (fifo, durable)",
+		},
+		{
 			Name:        "db_path",
 			Type:        "string",
 			Required:    false,
@@ -329,8 +362,7 @@ type queueFS struct {
 	plugin *QueueFSPlugin
 }
 
-// Control file operations supported within each queue directory
-var queueOperations = map[string]bool{
+var fifoQueueOperations = map[string]bool{
 	"enqueue": true,
 	"dequeue": true,
 	"peek":    true,
@@ -338,9 +370,42 @@ var queueOperations = map[string]bool{
 	"clear":   true,
 }
 
+var durableQueueOperations = map[string]bool{
+	"enqueue": true,
+	"dequeue": true,
+	"size":    true,
+	"stats":   true,
+	"clear":   true,
+	"ack":     true,
+	"recover": true,
+}
+
+func (q *QueueFSPlugin) queueMode() string {
+	if q.mode == "" {
+		return queueModeFIFO
+	}
+	return q.mode
+}
+
+func (qfs *queueFS) queueOperations() map[string]bool {
+	if qfs.plugin.queueMode() == queueModeDurable {
+		return durableQueueOperations
+	}
+	return fifoQueueOperations
+}
+
+func (q *QueueFSPlugin) durableBackend() (DurableQueueBackend, bool) {
+	if q.backend == nil {
+		return nil, false
+	}
+	durableBackend, ok := q.backend.(DurableQueueBackend)
+	return durableBackend, ok
+}
+
 // parseQueuePath parses a path like "/queue_name/operation" or "/dir/queue_name/operation"
-// Returns (queueName, operation, isDir, error)
-func parseQueuePath(path string) (queueName string, operation string, isDir bool, err error) {
+// using the control files exposed by the current queue mode.
+// Returns (queueName, operation, isDir, error).
+func parseQueuePath(path string, operations map[string]bool) (queueName string, operation string, isDir bool, err error) {
 	// Clean the path
 	path = filepath.Clean(path)
 
@@ -360,7 +425,7 @@ func parseQueuePath(path string) (queueName string, operation string, isDir bool
 
 	// Check if the last component is a queue operation
 	lastPart := parts[len(parts)-1]
-	if queueOperations[lastPart] {
+	if operations[lastPart] {
 		// This is a queue operation file
 		if len(parts) == 1 {
 			return "", "", false, fmt.Errorf("invalid path: operation without queue name")
@@ -376,12 +441,12 @@ func parseQueuePath(path string) (queueName string, operation string, isDir bool
 }
 
 // isValidQueueOperation checks if an operation name is valid
-func isValidQueueOperation(op string) bool {
-	return queueOperations[op]
+func (qfs *queueFS) isValidQueueOperation(op string) bool {
+	return qfs.queueOperations()[op]
 }
 
 func (qfs *queueFS) Create(path string) error {
-	_, operation, isDir, err := parseQueuePath(path)
+	_, operation, isDir, err := parseQueuePath(path, qfs.queueOperations())
 	if err != nil {
 		return err
 	}
@@ -390,7 +455,7 @@ func (qfs *queueFS) Create(path string) error {
 		return fmt.Errorf("cannot create files: %s is a directory", path)
 	}
 
-	if operation != "" && isValidQueueOperation(operation) {
+	if operation != "" && qfs.isValidQueueOperation(operation) {
 		// Control files are virtual, no need to create
 		return nil
 	}
@@ -399,7 +464,7 @@ func (qfs *queueFS) Create(path string) error {
 }
 
 func (qfs *queueFS) Mkdir(path string, perm uint32) error {
-	queueName, _, isDir, err := parseQueuePath(path)
+	queueName, _, isDir, err := parseQueuePath(path, qfs.queueOperations())
 	if err != nil {
 		return err
 	}
@@ -420,7 +485,7 @@ func (qfs *queueFS) Mkdir(path string, perm uint32) error {
 }
 
 func (qfs *queueFS) Remove(path string) error {
-	_, operation, isDir, err := parseQueuePath(path)
+	_, operation, isDir, err := parseQueuePath(path, qfs.queueOperations())
 	if err != nil {
 		return err
 	}
@@ -437,7 +502,7 @@ func (qfs *queueFS) Remove(path string) error {
 }
 
 func (qfs *queueFS) RemoveAll(path string) error {
-	queueName, _, isDir, err := parseQueuePath(path)
+	queueName, _, isDir, err := parseQueuePath(path, qfs.queueOperations())
 	if err != nil {
 		return err
 	}
@@ -459,7 +524,7 @@ func (qfs *queueFS) Read(path string, offset int64, size int64) ([]byte, error) 
 		return plugin.ApplyRangeRead(data, offset, size)
 	}
 
-	queueName, operation, isDir, err := parseQueuePath(path)
+	queueName, operation, isDir, err := parseQueuePath(path, qfs.queueOperations())
 	if err != nil {
 		return nil, err
 	}
@@ -469,6 +534,9 @@ func (qfs *queueFS) Read(path string, offset int64, size int64) ([]byte, error) 
 	}
 
 	if operation == "" {
+		return nil, fmt.Errorf("no such file: %s", path)
+	}
+	if !qfs.isValidQueueOperation(operation) {
 		return nil, fmt.Errorf("no such file: %s", path)
 	}
 
@@ -481,7 +549,9 @@ func (qfs *queueFS) Read(path string, offset int64, size int64) ([]byte, error) 
 		data, err = qfs.peek(queueName)
 	case "size":
 		data, err = qfs.size(queueName)
-	case "enqueue", "clear":
+	case "stats":
+		data, err = qfs.stats(queueName)
+	case "enqueue", "clear", "ack", "recover":
 		// Write-only files
 		return []byte(""), fmt.Errorf("permission denied: %s is write-only", path)
 	default:
@@ -496,7 +566,7 @@ func (qfs *queueFS) Read(path string, offset int64, size int64) ([]byte, error) 
 }
 
 func (qfs *queueFS) Write(path string, data []byte, offset int64, flags filesystem.WriteFlag) (int64, error) {
-	queueName, operation, isDir, err := parseQueuePath(path)
+	queueName, operation, isDir, err := parseQueuePath(path, qfs.queueOperations())
 	if err != nil {
 		return 0, err
 	}
@@ -506,6 +576,9 @@ func (qfs *queueFS) Write(path string, data []byte, offset int64, flags filesyst
 	}
 
 	if operation == "" {
+		return 0, fmt.Errorf("cannot write to: %s", path)
+	}
+	if !qfs.isValidQueueOperation(operation) {
 		return 0, fmt.Errorf("cannot write to: %s", path)
 	}
 
@@ -525,13 +598,23 @@ func (qfs *queueFS) Write(path string, data []byte, offset int64, flags filesyst
 			return 0, err
 		}
 		return 0, nil
+	case "ack":
+		if err := qfs.ack(queueName, data); err != nil {
+			return 0, err
+		}
+		return int64(len(data)), nil
+	case "recover":
+		if err := qfs.recover(queueName, data); err != nil {
+			return 0, err
+		}
+		return int64(len(data)), nil
 	default:
 		return 0, fmt.Errorf("cannot write to: %s", path)
 	}
 }
 
 func (qfs *queueFS) ReadDir(path string) ([]filesystem.FileInfo, error) {
-	queueName, _, isDir, err := parseQueuePath(path)
+	queueName, _, isDir, err := parseQueuePath(path, qfs.queueOperations())
 	if err != nil {
 		return nil, err
 	}
@@ -678,14 +761,6 @@ func (qfs *queueFS) getQueueControlFiles(queueName string, now time.Time) ([]fil
 			Meta:    filesystem.MetaData{Name: PluginName, Type: MetaValueQueueControl},
 		},
 		{
-			Name:    "peek",
-			Size:    0,
-			Mode:    0444,            // read-only
-			ModTime: lastEnqueueTime, // Use last enqueue time for poll offset tracking
-			IsDir:   false,
-			Meta:    filesystem.MetaData{Name: PluginName, Type: MetaValueQueueControl},
-		},
-		{
 			Name:    "size",
 			Size:    int64(len(strconv.Itoa(queueSize))),
 			Mode:    0444, // read-only
@@ -701,6 +776,41 @@ func (qfs *queueFS) getQueueControlFiles(queueName string, now time.Time) ([]fil
 			IsDir:   false,
 			Meta:    filesystem.MetaData{Name: PluginName, Type: MetaValueQueueControl},
 		},
+	}
+	if qfs.plugin.queueMode() == queueModeDurable {
+		files = append(files, filesystem.FileInfo{
+			Name:    "stats",
+			Size:    0,
+			Mode:    0444, // read-only
+			ModTime: now,
+			IsDir:   false,
+			Meta:    filesystem.MetaData{Name: PluginName, Type: MetaValueQueueStatus},
+		})
+		files = append(files, filesystem.FileInfo{
+			Name:    "ack",
+			Size:    0,
+			Mode:    0222, // write-only
+			ModTime: now,
+			IsDir:   false,
+			Meta:    filesystem.MetaData{Name: PluginName, Type: MetaValueQueueControl},
+		})
+		files = append(files, filesystem.FileInfo{
+			Name:    "recover",
+			Size:    0,
+			Mode:    0222, // write-only
+			ModTime: now,
+			IsDir:   false,
+			Meta:    filesystem.MetaData{Name: PluginName, Type: MetaValueQueueControl},
+		})
+	} else {
+		files = append(files, filesystem.FileInfo{
+			Name:    "peek",
+			Size:    0,
+			Mode:    0444,            // read-only
+			ModTime: lastEnqueueTime, // Use last enqueue time for poll offset tracking
+			IsDir:   false,
+			Meta:    filesystem.MetaData{Name: PluginName, Type: MetaValueQueueControl},
+		})
 	}
 
 	return files, nil
@@ -718,6 +828,7 @@ func (qfs *queueFS) Stat(path string) (*filesystem.FileInfo, error) {
 				Name: PluginName,
 				Content: map[string]string{
 					"backend": qfs.plugin.backend.GetType(),
+					"mode":    qfs.plugin.queueMode(),
 				},
 			},
 		}, nil
@@ -736,7 +847,7 @@ func (qfs *queueFS) Stat(path string) (*filesystem.FileInfo, error) {
 		}, nil
 	}
 
-	queueName, operation, isDir, err := parseQueuePath(path)
+	queueName, operation, isDir, err := parseQueuePath(path, qfs.queueOperations())
 	if err != nil {
 		return nil, err
 	}
@@ -794,9 +905,12 @@ func (qfs *queueFS) Stat(path string) (*filesystem.FileInfo, error) {
 	if operation == "" {
 		return nil, fmt.Errorf("no such file: %s", path)
 	}
+	if !qfs.isValidQueueOperation(operation) {
+		return nil, fmt.Errorf("no such file: %s", path)
+	}
 
 	mode := uint32(0644)
-	if operation == "enqueue" || operation == "clear" {
+	if operation == "enqueue" || operation == "clear" || operation == "ack" || operation == "recover" {
 		mode = 0222
 	} else {
 		mode = 0444
@@ -810,6 +924,8 @@ func (qfs *queueFS) Stat(path string) (*filesystem.FileInfo, error) {
 		fileType = MetaValueQueueStatus
 		queueSize, _ := qfs.plugin.backend.Size(queueName)
 		size = int64(len(strconv.Itoa(queueSize)))
+	} else if operation == "stats" {
+		fileType = MetaValueQueueStatus
 	} else if operation == "peek" {
 		// Use last enqueue time for peek's ModTime
 		lastEnqueueTime, err := qfs.plugin.backend.GetLastEnqueueTime(queueName)
@@ -900,6 +1016,26 @@ func (qfs *queueFS) enqueue(queueName string, data []byte) ([]byte, error) {
 }
 
 func (qfs *queueFS) dequeue(queueName string) ([]byte, error) {
+	if qfs.plugin.queueMode() == queueModeDurable {
+		qfs.plugin.mu.Lock()
+		defer qfs.plugin.mu.Unlock()
+
+		durableBackend, ok := qfs.plugin.durableBackend()
+		if !ok {
+			return nil, fmt.Errorf("durable queue backend is not available")
+		}
+
+		msg, found, err := durableBackend.Claim(queueName, ClaimRequest{LeaseDuration: queueFSDurableDefaultLeaseDuration})
+		if err != nil {
+			return nil, err
+		}
+		if !found {
+			return []byte("{}"), nil
+		}
+
+		return json.Marshal(msg)
+	}
+
 	qfs.plugin.mu.Lock()
 	defer qfs.plugin.mu.Unlock()
 
@@ -917,6 +1053,10 @@ func (qfs *queueFS) dequeue(queueName string) ([]byte, error) {
 }
 
 func (qfs *queueFS) peek(queueName string) ([]byte, error) {
+	if qfs.plugin.queueMode() == queueModeDurable {
+		return nil, fmt.Errorf("peek is not available in durable mode")
+	}
+
 	qfs.plugin.mu.RLock()
 	defer qfs.plugin.mu.RUnlock()
 
@@ -945,11 +1085,99 @@ func (qfs *queueFS) size(queueName string) ([]byte, error) {
 	return []byte(strconv.Itoa(count)), nil
 }
 
+func (qfs *queueFS) stats(queueName string) ([]byte, error) {
+	qfs.plugin.mu.RLock()
+	defer qfs.plugin.mu.RUnlock()
+
+	durableBackend, ok := qfs.plugin.durableBackend()
+	if !ok {
+		return nil, fmt.Errorf("durable queue backend is not available")
+	}
+
+	stats, err := durableBackend.Stats(queueName)
+	if err != nil {
+		return nil, err
+	}
+
+	return json.Marshal(stats)
+}
+
 func (qfs *queueFS) clear(queueName string) error {
 	qfs.plugin.mu.Lock()
 	defer qfs.plugin.mu.Unlock()
 
 	return qfs.plugin.backend.Clear(queueName)
+}
+
+type durableAckRequest struct {
+	MessageID string `json:"message_id"`
+	Receipt   string `json:"receipt"`
+}
+
+type durableRecoverRequest struct {
+	Limit int `json:"limit"`
+}
+
+func parseDurableAckRequest(data []byte) (durableAckRequest, error) {
+	// Durable control files use small JSON payloads so the wire contract is stable
+	// across the AGFS shell, direct file writes, and future non-filesystem clients.
+	var req durableAckRequest
+	if err := json.Unmarshal(data, &req); err != nil {
+		return durableAckRequest{}, fmt.Errorf("invalid durable ack payload: %w", err)
+	}
+	if req.MessageID == "" || req.Receipt == "" {
+		return durableAckRequest{}, fmt.Errorf("invalid durable ack payload: message_id and receipt are required")
+	}
+	return req, nil
+}
+
+func parseDurableRecoverRequest(data []byte) (durableRecoverRequest, error) {
+	if len(bytes.TrimSpace(data)) == 0 {
+		// Treat an empty recover write as "use backend defaults" to keep the file
+		// interface ergonomic for manual operators.
+		return durableRecoverRequest{}, nil
+	}
+	var req durableRecoverRequest
+	if err := json.Unmarshal(data, &req); err != nil {
+		return durableRecoverRequest{}, fmt.Errorf("invalid durable recover payload: %w", err)
+	}
+	if req.Limit < 0 {
+		return durableRecoverRequest{}, fmt.Errorf("invalid durable recover payload: limit must be non-negative")
+	}
+	return req, nil
+}
+
+func (qfs *queueFS) ack(queueName string, data []byte) error {
+	req, err := parseDurableAckRequest(data)
+	if err != nil {
+		return err
+	}
+
+	qfs.plugin.mu.Lock()
+	defer qfs.plugin.mu.Unlock()
+
+	durableBackend, ok := qfs.plugin.durableBackend()
+	if !ok {
+		return fmt.Errorf("durable queue backend is not available")
+	}
+	return durableBackend.Ack(queueName, req.MessageID, req.Receipt)
+}
+
+func (qfs *queueFS) recover(queueName string, data []byte) error {
+	req, err := parseDurableRecoverRequest(data)
+	if err != nil {
+		return err
+	}
+
+	qfs.plugin.mu.Lock()
+	defer qfs.plugin.mu.Unlock()
+
+	durableBackend, ok := qfs.plugin.durableBackend()
+	if !ok {
+		return fmt.Errorf("durable queue backend is not available")
+	}
+	_, err = durableBackend.RecoverExpired(queueName, time.Now().UTC(), req.Limit)
+	return err
 }
 
 // Ensure QueueFSPlugin implements ServicePlugin
@@ -967,7 +1195,7 @@ type queueFileHandle struct {
 	qfs       *queueFS
 	path      string
 	queueName string
-	operation string // "enqueue", "dequeue", "peek", "size", "clear"
+	operation string // queue control file name
 	flags     filesystem.OpenFlag
 
 	// For dequeue/peek: cached message data (read once, return from cache)
@@ -993,7 +1221,7 @@ var queueHandleManager = &handleManager{
 
 // OpenHandle opens a file and returns a handle for stateful operations
 func (qfs *queueFS) OpenHandle(path string, flags filesystem.OpenFlag, mode uint32) (filesystem.FileHandle, error) {
-	queueName, operation, isDir, err := parseQueuePath(path)
+	queueName, operation, isDir, err := parseQueuePath(path, qfs.queueOperations())
 	if err != nil {
 		return nil, err
 	}
@@ -1006,8 +1234,8 @@ func (qfs *queueFS) OpenHandle(path string, flags filesystem.OpenFlag, mode uint
 		return nil, fmt.Errorf("cannot open queue directory: %s", path)
 	}
 
-	// Validate operation
-	if !queueOperations[operation] {
+	// Validate operation for the current queue mode.
+	if !qfs.isValidQueueOperation(operation) {
 		return nil, fmt.Errorf("unknown operation: %s", operation)
 	}
 
@@ -1089,7 +1317,9 @@ func (h *queueFileHandle) Read(buf []byte) (int, error) {
 			data, err = h.qfs.peek(h.queueName)
 		case "size":
 			data, err = h.qfs.size(h.queueName)
-		case "enqueue", "clear":
+		case "stats":
+			data, err = h.qfs.stats(h.queueName)
+		case "enqueue", "clear", "ack", "recover":
 			// These are write-only operations
 			return 0, io.EOF
 		default:
@@ -1130,7 +1360,9 @@ func (h *queueFileHandle) ReadAt(buf []byte, offset int64) (int, error) {
 			data, err = h.qfs.peek(h.queueName)
 		case "size":
 			data, err = h.qfs.size(h.queueName)
-		case "enqueue", "clear":
+		case "stats":
+			data, err = h.qfs.stats(h.queueName)
+		case "enqueue", "clear", "ack", "recover":
 			// These are write-only operations
 			return 0, io.EOF
 		default:
@@ -1175,7 +1407,17 @@ func (h *queueFileHandle) WriteAt(data []byte, offset int64) (int, error) {
 			return 0, err
 		}
 		return len(data), nil
-	case "dequeue", "peek", "size":
+	case "ack":
+		if err := h.qfs.ack(h.queueName, data); err != nil {
+			return 0, err
+		}
+		return len(data), nil
+	case "recover":
+		if err := h.qfs.recover(h.queueName, data); err != nil {
+			return 0, err
+		}
+		return len(data), nil
+	case "dequeue", "peek", "size", "stats":
 		return 0, fmt.Errorf("cannot write to %s", h.operation)
 	default:
 		return 0, fmt.Errorf("unsupported write operation: %s", h.operation)

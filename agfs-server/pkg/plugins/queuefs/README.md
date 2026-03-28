@@ -30,6 +30,13 @@ uv run agfs mount queuefs /jobs
 
 None required - QueueFS works with default settings
 
+Optional settings:
+
+- `mode = "fifo"` keeps the original `enqueue/dequeue/peek/size/clear` contract.
+- `mode = "durable"` switches `dequeue` to claim/lease semantics and exposes `ack`, `recover`, and `stats` instead of `peek`.
+
+Durable mode is supported by the in-memory, SQLite, PostgreSQL, and TiDB backends.
+
 ## Usage
 Enqueue a message:
 ```bash
@@ -54,6 +61,23 @@ cat /size
 Clear the queue:
 ```bash
 echo "" > /clear
+```
+
+Durable claim/ack workflow:
+
+- The durable dequeue payload keeps `data` as the same plain string body used by the regular queue message JSON.
+
+```bash
+# Enable durable mode in plugin config first.
+cat /dequeue
+{"message_id":"...","queue_name":"jobs","data":"...","receipt":"...","claimed_at":"...","lease_until":"...","attempt":1}
+
+echo '{"message_id":"...","receipt":"..."}' > /ack
+cat /stats
+{"pending":0,"processing":0,"recoveries":0}
+
+# Recover expired claims manually when needed.
+echo '{"limit":100}' > /recover
 ```
 
 ## Example

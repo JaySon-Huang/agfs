@@ -8,11 +8,14 @@ import (
 	"time"
 
 	model "github.com/c4pt0r/agfs/agfs-server/pkg/plugins/queuefs/internal"
+	"github.com/google/uuid"
 	"github.com/pingcap/failpoint"
 	log "github.com/sirupsen/logrus"
 )
 
 type QueueMessage = model.QueueMessage
+
+const defaultLeaseDuration = 30 * time.Second
 
 // Backend implements QueueBackend using a SQL database.
 // queuefs_registry is the logical source of truth for queue existence and
@@ -34,6 +37,7 @@ type queueDeleteTarget struct {
 	tableName string
 }
 
+// newBackend wires a SQL queue backend to an optional concrete DBBackend.
 func newBackend(backendType string, backend DBBackend) *Backend {
 	return &Backend{
 		backendType: backendType,
@@ -42,18 +46,23 @@ func newBackend(backendType string, backend DBBackend) *Backend {
 	}
 }
 
+// NewBackend returns a SQL-backed queue backend that resolves the concrete
+// database implementation from configuration at initialization time.
 func NewBackend() *Backend {
 	return newBackend("", nil)
 }
 
+// NewSQLiteBackend returns a queue backend pinned to the SQLite implementation.
 func NewSQLiteBackend() *Backend {
 	return newBackend("sqlite", NewSQLiteDBBackend())
 }
 
+// NewTiDBBackend returns a queue backend pinned to the TiDB implementation.
 func NewTiDBBackend() *Backend {
 	return newBackend("tidb", NewTiDBDBBackend())
 }
 
+// NewPostgresBackend returns a queue backend pinned to the PostgreSQL implementation.
 func NewPostgresBackend() *Backend {
 	return newBackend("pgsql", NewPostgreSQLDBBackend())
 }
@@ -124,6 +133,33 @@ func (b *Backend) boolLiteral(value bool) string {
 		return "0"
 	}
 	return b.backend.BoolLiteral(value)
+}
+
+func (b *Backend) pendingPredicate() string {
+	// Durable state is encoded inline on the queue row: pending rows have not
+	// been deleted and do not yet carry an active receipt.
+	return fmt.Sprintf("deleted = %s AND receipt IS NULL", b.boolLiteral(false))
+}
+
+func (b *Backend) processingPredicate() string {
+	// Claimed rows stay in the same table and flip into processing state by
+	// attaching a receipt/lease instead of moving to a side table.
+	return fmt.Sprintf("deleted = %s AND receipt IS NOT NULL", b.boolLiteral(false))
+}
+
+func normalizeLeaseDuration(req model.ClaimRequest) time.Duration {
+	if req.LeaseDuration <= 0 {
+		return defaultLeaseDuration
+	}
+	return req.LeaseDuration
+}
+
+func decodeStoredMessage(raw string) (QueueMessage, error) {
+	var msg QueueMessage
+	if err := json.Unmarshal([]byte(raw), &msg); err != nil {
+		return QueueMessage{}, fmt.Errorf("failed to unmarshal message: %w", err)
+	}
+	return msg, nil
 }
 
 func (b *Backend) getTableName(queueName string, forceRefresh bool) (string, error) {
@@ -263,8 +299,8 @@ func (b *Backend) Dequeue(queueName string) (QueueMessage, bool, error) {
 	var data string
 
 	querySQL := fmt.Sprintf(
-		"SELECT id, data FROM %s WHERE deleted = %s ORDER BY id LIMIT 1",
-		tableName, b.boolLiteral(false),
+		"SELECT id, data FROM %s WHERE %s ORDER BY id LIMIT 1",
+		tableName, b.pendingPredicate(),
 	)
 	if b.backend != nil && b.backend.SupportsSkipLocked() {
 		querySQL += " FOR UPDATE SKIP LOCKED"
@@ -279,8 +315,8 @@ func (b *Backend) Dequeue(queueName string) (QueueMessage, bool, error) {
 	}
 
 	updateSQL := fmt.Sprintf(
-		"UPDATE %s SET deleted = %s, deleted_at = CURRENT_TIMESTAMP WHERE id = ? AND deleted = %s",
-		tableName, b.boolLiteral(true), b.boolLiteral(false),
+		"UPDATE %s SET deleted = %s, deleted_at = CURRENT_TIMESTAMP WHERE id = ? AND %s",
+		tableName, b.boolLiteral(true), b.pendingPredicate(),
 	)
 	updateSQL = b.rebind(updateSQL)
 	result, err := tx.Exec(updateSQL, id)
@@ -299,9 +335,9 @@ func (b *Backend) Dequeue(queueName string) (QueueMessage, bool, error) {
 		return QueueMessage{}, false, fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
-	var msg QueueMessage
-	if err := json.Unmarshal([]byte(data), &msg); err != nil {
-		return QueueMessage{}, false, fmt.Errorf("failed to unmarshal message: %w", err)
+	msg, err := decodeStoredMessage(data)
+	if err != nil {
+		return QueueMessage{}, false, err
 	}
 
 	return msg, true, nil
@@ -317,8 +353,8 @@ func (b *Backend) Peek(queueName string) (QueueMessage, bool, error) {
 
 	var data string
 	querySQL := fmt.Sprintf(
-		"SELECT data FROM %s WHERE deleted = %s ORDER BY id LIMIT 1",
-		tableName, b.boolLiteral(false),
+		"SELECT data FROM %s WHERE %s ORDER BY id LIMIT 1",
+		tableName, b.pendingPredicate(),
 	)
 	err = b.db.QueryRow(querySQL).Scan(&data)
 
@@ -328,9 +364,9 @@ func (b *Backend) Peek(queueName string) (QueueMessage, bool, error) {
 		return QueueMessage{}, false, fmt.Errorf("failed to peek message: %w", err)
 	}
 
-	var msg QueueMessage
-	if err := json.Unmarshal([]byte(data), &msg); err != nil {
-		return QueueMessage{}, false, fmt.Errorf("failed to unmarshal message: %w", err)
+	msg, err := decodeStoredMessage(data)
+	if err != nil {
+		return QueueMessage{}, false, err
 	}
 
 	return msg, true, nil
@@ -346,8 +382,8 @@ func (b *Backend) Size(queueName string) (int, error) {
 
 	var count int
 	querySQL := fmt.Sprintf(
-		"SELECT COUNT(*) FROM %s WHERE deleted = %s",
-		tableName, b.boolLiteral(false),
+		"SELECT COUNT(*) FROM %s WHERE %s",
+		tableName, b.pendingPredicate(),
 	)
 	err = b.db.QueryRow(querySQL).Scan(&count)
 	if err != nil {
@@ -415,8 +451,8 @@ func (b *Backend) GetLastEnqueueTime(queueName string) (time.Time, error) {
 
 	var timestamp sql.NullInt64
 	querySQL := fmt.Sprintf(
-		"SELECT MAX(timestamp) FROM %s WHERE deleted = %s",
-		tableName, b.boolLiteral(false),
+		"SELECT MAX(timestamp) FROM %s WHERE %s",
+		tableName, b.pendingPredicate(),
 	)
 	err = b.db.QueryRow(querySQL).Scan(&timestamp)
 
@@ -534,4 +570,248 @@ func (b *Backend) QueueExists(queueName string) (bool, error) {
 		return false, fmt.Errorf("failed to check queue existence: %w", err)
 	}
 	return count > 0, nil
+}
+
+func (b *Backend) Claim(queueName string, req model.ClaimRequest) (model.ClaimedMessage, bool, error) {
+	tableName, err := b.getTableName(queueName, false)
+	if err == sql.ErrNoRows {
+		return model.ClaimedMessage{}, false, nil
+	} else if err != nil {
+		return model.ClaimedMessage{}, false, fmt.Errorf("failed to get queue table name: %w", err)
+	}
+
+	tx, err := b.db.Begin()
+	if err != nil {
+		return model.ClaimedMessage{}, false, fmt.Errorf("failed to start transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	var id int64
+	var messageID string
+	var data string
+	var attempt int
+	querySQL := fmt.Sprintf(
+		"SELECT id, message_id, data, attempt FROM %s WHERE %s ORDER BY id LIMIT 1",
+		tableName, b.pendingPredicate(),
+	)
+	if b.backend != nil && b.backend.SupportsSkipLocked() {
+		// Prefer SKIP LOCKED when available so concurrent claimers naturally spread
+		// across different rows instead of blocking one another.
+		querySQL += " FOR UPDATE SKIP LOCKED"
+	}
+	querySQL = b.rebind(querySQL)
+	if err := tx.QueryRow(querySQL).Scan(&id, &messageID, &data, &attempt); err != nil {
+		if err == sql.ErrNoRows {
+			return model.ClaimedMessage{}, false, nil
+		}
+		return model.ClaimedMessage{}, false, fmt.Errorf("failed to query claimable message: %w", err)
+	}
+
+	message, err := decodeStoredMessage(data)
+	if err != nil {
+		return model.ClaimedMessage{}, false, err
+	}
+
+	claimedAt := time.Now().UTC()
+	leaseUntil := claimedAt.Add(normalizeLeaseDuration(req))
+	receipt := uuid.NewString()
+	updateSQL := fmt.Sprintf(
+		"UPDATE %s SET receipt = ?, claimed_at = ?, lease_until = ?, attempt = ? WHERE id = ? AND %s",
+		tableName, b.pendingPredicate(),
+	)
+	updateSQL = b.rebind(updateSQL)
+	// The claim is finalized by a conditional row update in the same transaction.
+	// If another worker wins the race first, RowsAffected becomes zero and the
+	// caller simply observes an empty claim result.
+	result, err := tx.Exec(updateSQL, receipt, claimedAt.Unix(), leaseUntil.Unix(), attempt+1, id)
+	if err != nil {
+		return model.ClaimedMessage{}, false, fmt.Errorf("failed to claim message: %w", err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return model.ClaimedMessage{}, false, fmt.Errorf("failed to verify claim result: %w", err)
+	}
+	if rowsAffected == 0 {
+		return model.ClaimedMessage{}, false, nil
+	}
+	if err := tx.Commit(); err != nil {
+		return model.ClaimedMessage{}, false, fmt.Errorf("failed to commit claim: %w", err)
+	}
+
+	return model.ClaimedMessage{
+		MessageID:  messageID,
+		QueueName:  queueName,
+		Data:       message.Data,
+		Receipt:    receipt,
+		ClaimedAt:  claimedAt,
+		LeaseUntil: leaseUntil,
+		Attempt:    attempt + 1,
+	}, true, nil
+}
+
+func (b *Backend) Ack(queueName string, messageID string, receipt string) error {
+	tableName, err := b.getTableName(queueName, false)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("queue does not exist: %s", queueName)
+	} else if err != nil {
+		return fmt.Errorf("failed to get queue table name: %w", err)
+	}
+
+	updateSQL := fmt.Sprintf(
+		"UPDATE %s SET deleted = %s, deleted_at = CURRENT_TIMESTAMP, receipt = NULL, claimed_at = NULL, lease_until = NULL WHERE message_id = ? AND receipt = ? AND %s",
+		tableName, b.boolLiteral(true), b.processingPredicate(),
+	)
+	updateSQL = b.rebind(updateSQL)
+	result, err := b.db.Exec(updateSQL, messageID, receipt)
+	if err != nil {
+		return fmt.Errorf("failed to ack message: %w", err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to verify ack result: %w", err)
+	}
+	if rowsAffected == 0 {
+		return fmt.Errorf("message %q is not currently claimed with the provided receipt", messageID)
+	}
+	return nil
+}
+
+func (b *Backend) Release(queueName string, messageID string, req model.ReleaseRequest) error {
+	tableName, err := b.getTableName(queueName, false)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("queue does not exist: %s", queueName)
+	} else if err != nil {
+		return fmt.Errorf("failed to get queue table name: %w", err)
+	}
+
+	updateSQL := fmt.Sprintf(
+		"UPDATE %s SET receipt = NULL, claimed_at = NULL, lease_until = NULL WHERE message_id = ? AND receipt = ? AND %s",
+		tableName, b.processingPredicate(),
+	)
+	updateSQL = b.rebind(updateSQL)
+	result, err := b.db.Exec(updateSQL, messageID, req.Receipt)
+	if err != nil {
+		return fmt.Errorf("failed to release message: %w", err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to verify release result: %w", err)
+	}
+	if rowsAffected == 0 {
+		return fmt.Errorf("message %q is not currently claimed with the provided receipt", messageID)
+	}
+	return nil
+}
+
+func (b *Backend) RecoverExpired(queueName string, now time.Time, limit int) (int, error) {
+	tableName, err := b.getTableName(queueName, false)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	} else if err != nil {
+		return 0, fmt.Errorf("failed to get queue table name: %w", err)
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+
+	tx, err := b.db.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("failed to start transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	querySQL := fmt.Sprintf(
+		"SELECT message_id FROM %s WHERE %s AND lease_until IS NOT NULL AND lease_until <= ? ORDER BY id",
+		tableName, b.processingPredicate(),
+	)
+	args := []interface{}{now.Unix()}
+	if limit > 0 {
+		querySQL += " LIMIT ?"
+		args = append(args, limit)
+	}
+	if b.backend != nil && b.backend.SupportsSkipLocked() {
+		// Keep recovery non-blocking under concurrent claimers by skipping rows that
+		// another session already locked for claim/recovery work.
+		querySQL += " FOR UPDATE SKIP LOCKED"
+	}
+	querySQL = b.rebind(querySQL)
+	rows, err := tx.Query(querySQL, args...)
+	if err != nil {
+		return 0, fmt.Errorf("failed to query expired claims: %w", err)
+	}
+	defer rows.Close()
+
+	var messageIDs []string
+	for rows.Next() {
+		var messageID string
+		if err := rows.Scan(&messageID); err != nil {
+			return 0, fmt.Errorf("failed to scan expired claim: %w", err)
+		}
+		messageIDs = append(messageIDs, messageID)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("failed to iterate expired claims: %w", err)
+	}
+
+	updateSQL := fmt.Sprintf(
+		"UPDATE %s SET receipt = NULL, claimed_at = NULL, lease_until = NULL, recovery_count = recovery_count + 1 WHERE message_id = ? AND %s AND lease_until IS NOT NULL AND lease_until <= ?",
+		tableName, b.processingPredicate(),
+	)
+	updateSQL = b.rebind(updateSQL)
+	recovered := 0
+	// Apply recovery row by row so the same code path works across SQLite,
+	// PostgreSQL, and TiDB without relying on dialect-specific bulk UPDATE syntax.
+	// TODO(queuefs): revisit this if recovery throughput becomes a bottleneck.
+	// A batched UPDATE may be faster, but it needs dialect-specific handling and
+	// careful verification across SQLite, PostgreSQL, TiDB, and future MySQL support.
+	for _, messageID := range messageIDs {
+		result, err := tx.Exec(updateSQL, messageID, now.Unix())
+		if err != nil {
+			return 0, fmt.Errorf("failed to recover message %q: %w", messageID, err)
+		}
+		rowsAffected, err := result.RowsAffected()
+		if err != nil {
+			return 0, fmt.Errorf("failed to verify recovery result: %w", err)
+		}
+		recovered += int(rowsAffected)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("failed to commit recovery: %w", err)
+	}
+	return recovered, nil
+}
+
+func (b *Backend) Stats(queueName string) (model.QueueStats, error) {
+	tableName, err := b.getTableName(queueName, false)
+	if err == sql.ErrNoRows {
+		return model.QueueStats{}, nil
+	} else if err != nil {
+		return model.QueueStats{}, fmt.Errorf("failed to get queue table name: %w", err)
+	}
+
+	var stats model.QueueStats
+	queries := []struct {
+		query  string
+		target interface{}
+	}{
+		{query: fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s", tableName, b.pendingPredicate()), target: &stats.Pending},
+		{query: fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s", tableName, b.processingPredicate()), target: &stats.Processing},
+	}
+	for _, item := range queries {
+		if err := b.db.QueryRow(item.query).Scan(item.target); err != nil {
+			return model.QueueStats{}, fmt.Errorf("failed to get queue stats: %w", err)
+		}
+	}
+
+	var recoveries sql.NullInt64
+	// Recoveries is defined as a queue-level historical counter, so acked rows
+	// continue contributing their recovery_count after they leave the live set.
+	recoveriesQuery := fmt.Sprintf("SELECT COALESCE(SUM(recovery_count), 0) FROM %s", tableName)
+	if err := b.db.QueryRow(recoveriesQuery).Scan(&recoveries); err != nil {
+		return model.QueueStats{}, fmt.Errorf("failed to get recovery stats: %w", err)
+	}
+	if recoveries.Valid {
+		stats.Recoveries = int(recoveries.Int64)
+	}
+	return stats, nil
 }

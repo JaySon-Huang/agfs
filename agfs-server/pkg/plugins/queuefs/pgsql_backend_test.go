@@ -59,9 +59,25 @@ func pgTestConfig(t *testing.T, database string) map[string]interface{} {
 
 func newPGTestQueueFS(t *testing.T, database string) *queueFS {
 	t.Helper()
+	plugin := newPGTestPluginWithConfig(t, database, nil)
+
+	fs, ok := plugin.GetFileSystem().(*queueFS)
+	if !ok {
+		t.Fatalf("unexpected filesystem type %T", plugin.GetFileSystem())
+	}
+	return fs
+}
+
+func newPGTestPluginWithConfig(t *testing.T, database string, extra map[string]interface{}) *QueueFSPlugin {
+	t.Helper()
+
+	cfg := pgTestConfig(t, database)
+	for key, value := range extra {
+		cfg[key] = value
+	}
 
 	plugin := NewQueueFSPlugin()
-	if err := plugin.Initialize(pgTestConfig(t, database)); err != nil {
+	if err := plugin.Initialize(cfg); err != nil {
 		t.Fatalf("initialize pgsql queuefs: %v", err)
 	}
 	t.Cleanup(func() {
@@ -69,12 +85,7 @@ func newPGTestQueueFS(t *testing.T, database string) *queueFS {
 			_ = plugin.backend.Close()
 		}
 	})
-
-	fs, ok := plugin.GetFileSystem().(*queueFS)
-	if !ok {
-		t.Fatalf("unexpected filesystem type %T", plugin.GetFileSystem())
-	}
-	return fs
+	return plugin
 }
 
 func newPGTestDatabaseName() string {
@@ -378,5 +389,76 @@ func TestQueueFSPGSQLConcurrentDequeueRegression(t *testing.T) {
 	}
 	if got := string(mustReadAll(t, writerFS, "/jobs/size")); got != "0" {
 		t.Fatalf("queue size after concurrent dequeue = %q, want 0", got)
+	}
+}
+
+func TestQueueFSPGSQLDurableLifecycle(t *testing.T) {
+	database := newPGTestDatabaseName()
+	plugin := newPGTestPluginWithConfig(t, database, map[string]interface{}{"mode": queueModeDurable})
+	fs, ok := plugin.GetFileSystem().(*queueFS)
+	if !ok {
+		t.Fatalf("unexpected filesystem type %T", plugin.GetFileSystem())
+	}
+
+	if err := fs.Mkdir("/jobs", 0o755); err != nil {
+		t.Fatalf("mkdir /jobs: %v", err)
+	}
+	if _, err := fs.Write("/jobs/enqueue", []byte("pgsql-durable"), -1, 0); err != nil {
+		t.Fatalf("enqueue durable pgsql message: %v", err)
+	}
+
+	claimedBytes := mustReadAll(t, fs, "/jobs/dequeue")
+	var claimed ClaimedMessage
+	if err := json.Unmarshal(claimedBytes, &claimed); err != nil {
+		t.Fatalf("unmarshal durable pgsql claim: %v (payload=%q)", err, string(claimedBytes))
+	}
+	if got := claimed.Data; got != "pgsql-durable" {
+		t.Fatalf("claimed durable pgsql data = %q, want pgsql-durable", got)
+	}
+	ackPayload := []byte(`{"message_id":"` + claimed.MessageID + `","receipt":"` + claimed.Receipt + `"}`)
+	if _, err := fs.Write("/jobs/ack", ackPayload, -1, 0); err != nil {
+		t.Fatalf("ack durable pgsql message: %v", err)
+	}
+	if got := string(mustReadAll(t, fs, "/jobs/size")); got != "0" {
+		t.Fatalf("durable pgsql size after ack = %q, want 0", got)
+	}
+
+	durableBackend, ok := plugin.backend.(DurableQueueBackend)
+	if !ok {
+		t.Fatal("pgsql backend should implement DurableQueueBackend")
+	}
+	if _, err := fs.Write("/jobs/enqueue", []byte("recover-pg"), -1, 0); err != nil {
+		t.Fatalf("enqueue recover pgsql message: %v", err)
+	}
+	claim, found, err := durableBackend.Claim("jobs", ClaimRequest{LeaseDuration: time.Second})
+	if err != nil {
+		t.Fatalf("claim recover pgsql message: %v", err)
+	}
+	if !found {
+		t.Fatal("expected recover pgsql message to be claimed")
+	}
+	if recovered, err := durableBackend.RecoverExpired("jobs", time.Now().UTC().Add(2*time.Second), 0); err != nil {
+		t.Fatalf("recover durable pgsql message: %v", err)
+	} else if recovered != 1 {
+		t.Fatalf("recovered durable pgsql count = %d, want 1", recovered)
+	}
+	reclaimed, found, err := durableBackend.Claim("jobs", ClaimRequest{})
+	if err != nil {
+		t.Fatalf("reclaim durable pgsql message: %v", err)
+	}
+	if !found || reclaimed.MessageID != claim.MessageID || reclaimed.Attempt != claim.Attempt+1 {
+		t.Fatalf("unexpected reclaimed durable pgsql message: found=%v claimed=%+v", found, reclaimed)
+	}
+	ackPayload = []byte(`{"message_id":"` + reclaimed.MessageID + `","receipt":"` + reclaimed.Receipt + `"}`)
+	if _, err := fs.Write("/jobs/ack", ackPayload, -1, 0); err != nil {
+		t.Fatalf("ack recovered durable pgsql message: %v", err)
+	}
+	statsBytes := mustReadAll(t, fs, "/jobs/stats")
+	var stats QueueStats
+	if err := json.Unmarshal(statsBytes, &stats); err != nil {
+		t.Fatalf("unmarshal durable pgsql stats after recovered ack: %v (payload=%q)", err, string(statsBytes))
+	}
+	if stats.Pending != 0 || stats.Processing != 0 || stats.Recoveries != 1 {
+		t.Fatalf("durable pgsql stats after recovered ack = %+v, want pending=0 processing=0 recoveries=1", stats)
 	}
 }

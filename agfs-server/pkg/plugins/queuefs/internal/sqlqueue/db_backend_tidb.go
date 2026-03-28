@@ -12,8 +12,10 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+// TiDBDBBackend adapts queuefs SQL operations to TiDB/MySQL-compatible syntax.
 type TiDBDBBackend struct{}
 
+// NewTiDBDBBackend returns a TiDB dialect adapter for queuefs.
 func NewTiDBDBBackend() *TiDBDBBackend { return &TiDBDBBackend{} }
 
 func (b *TiDBDBBackend) Open(cfg map[string]interface{}) (*sql.DB, error) {
@@ -136,14 +138,39 @@ func (b *TiDBDBBackend) QueueTableDDL(tableName string) string {
 		message_id VARCHAR(64) NOT NULL,
 		data LONGBLOB NOT NULL,
 		timestamp BIGINT NOT NULL,
+		attempt INT NOT NULL DEFAULT 0,
+		recovery_count INT NOT NULL DEFAULT 0,
+		receipt VARCHAR(128) NULL,
+		claimed_at BIGINT NULL,
+		lease_until BIGINT NULL,
 		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 		deleted TINYINT(1) DEFAULT 0,
 		deleted_at TIMESTAMP NULL,
-		INDEX idx_deleted_id (deleted, id)
+		INDEX idx_deleted_receipt_id (deleted, receipt, id),
+		INDEX idx_deleted_lease_until (deleted, lease_until)
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`, tableName)
 }
 
-func (b *TiDBDBBackend) EnsureQueueIndexes(db *sql.DB, tableName string) error { return nil }
+func (b *TiDBDBBackend) EnsureQueueIndexes(db *sql.DB, tableName string) error {
+	// TODO(queuefs): re-check this migration path against real MySQL variants.
+	// TiDB accepts these IF NOT EXISTS forms, but backend=mysql currently reuses
+	// this adapter and may need narrower compatibility handling.
+	alterSQL := []string{
+		fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS attempt INT NOT NULL DEFAULT 0", tableName),
+		fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS recovery_count INT NOT NULL DEFAULT 0", tableName),
+		fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS receipt VARCHAR(128) NULL", tableName),
+		fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS claimed_at BIGINT NULL", tableName),
+		fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS lease_until BIGINT NULL", tableName),
+		fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_deleted_receipt_id ON %s(deleted, receipt, id)", strings.TrimPrefix(tableName, "queuefs_queue_"), tableName),
+		fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_deleted_lease_until ON %s(deleted, lease_until)", strings.TrimPrefix(tableName, "queuefs_queue_"), tableName),
+	}
+	for _, stmt := range alterSQL {
+		if _, err := db.Exec(stmt); err != nil {
+			return fmt.Errorf("failed to evolve queue schema: %w", err)
+		}
+	}
+	return nil
+}
 func (b *TiDBDBBackend) RegistryInsertSQL() string {
 	return "INSERT IGNORE INTO queuefs_registry (queue_name, table_name) VALUES (?, ?)"
 }

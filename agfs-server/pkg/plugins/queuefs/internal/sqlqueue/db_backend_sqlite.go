@@ -9,8 +9,10 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
+// SQLiteDBBackend adapts queuefs SQL operations to SQLite.
 type SQLiteDBBackend struct{}
 
+// NewSQLiteDBBackend returns a SQLite dialect adapter for queuefs.
 func NewSQLiteDBBackend() *SQLiteDBBackend {
 	return &SQLiteDBBackend{}
 }
@@ -44,6 +46,11 @@ func (b *SQLiteDBBackend) QueueTableDDL(tableName string) string {
 		message_id TEXT NOT NULL,
 		data BLOB NOT NULL,
 		timestamp INTEGER NOT NULL,
+		attempt INTEGER NOT NULL DEFAULT 0,
+		recovery_count INTEGER NOT NULL DEFAULT 0,
+		receipt TEXT NULL,
+		claimed_at INTEGER NULL,
+		lease_until INTEGER NULL,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		deleted INTEGER DEFAULT 0,
 		deleted_at DATETIME NULL
@@ -51,14 +58,18 @@ func (b *SQLiteDBBackend) QueueTableDDL(tableName string) string {
 }
 
 func (b *SQLiteDBBackend) EnsureQueueIndexes(db *sql.DB, tableName string) error {
-	indexSQL := fmt.Sprintf(
-		"CREATE INDEX IF NOT EXISTS idx_%s_deleted_id ON %s(deleted, id)",
-		strings.TrimPrefix(tableName, "queuefs_queue_"),
-		tableName,
-	)
-	_, err := db.Exec(indexSQL)
-	if err != nil {
-		return fmt.Errorf("failed to create queue index: %w", err)
+	if err := ensureSQLiteDurableColumns(db, tableName); err != nil {
+		return err
+	}
+	baseName := strings.TrimPrefix(tableName, "queuefs_queue_")
+	indexSQLs := []string{
+		fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_deleted_receipt_id ON %s(deleted, receipt, id)", baseName, tableName),
+		fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_deleted_lease_until ON %s(deleted, lease_until)", baseName, tableName),
+	}
+	for _, indexSQL := range indexSQLs {
+		if _, err := db.Exec(indexSQL); err != nil {
+			return fmt.Errorf("failed to create queue index: %w", err)
+		}
 	}
 	return nil
 }
@@ -72,4 +83,51 @@ func (b *SQLiteDBBackend) BoolLiteral(value bool) string {
 		return "1"
 	}
 	return "0"
+}
+
+func ensureSQLiteDurableColumns(db *sql.DB, tableName string) error {
+	// SQLite lacks ADD COLUMN IF NOT EXISTS on older deployments, so schema
+	// evolution inspects the table first and only applies missing durable fields.
+	rows, err := db.Query(fmt.Sprintf("PRAGMA table_info(%s)", tableName))
+	if err != nil {
+		return fmt.Errorf("failed to inspect queue table schema: %w", err)
+	}
+	defer rows.Close()
+
+	columns := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name string
+		var columnType string
+		var notNull int
+		var defaultValue sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			return fmt.Errorf("failed to scan queue table schema: %w", err)
+		}
+		columns[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("failed to iterate queue table schema: %w", err)
+	}
+
+	addColumns := []struct {
+		name string
+		ddl  string
+	}{
+		{name: "attempt", ddl: "ALTER TABLE %s ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0"},
+		{name: "recovery_count", ddl: "ALTER TABLE %s ADD COLUMN recovery_count INTEGER NOT NULL DEFAULT 0"},
+		{name: "receipt", ddl: "ALTER TABLE %s ADD COLUMN receipt TEXT NULL"},
+		{name: "claimed_at", ddl: "ALTER TABLE %s ADD COLUMN claimed_at INTEGER NULL"},
+		{name: "lease_until", ddl: "ALTER TABLE %s ADD COLUMN lease_until INTEGER NULL"},
+	}
+	for _, column := range addColumns {
+		if columns[column.name] {
+			continue
+		}
+		if _, err := db.Exec(fmt.Sprintf(column.ddl, tableName)); err != nil {
+			return fmt.Errorf("failed to add queue column %q: %w", column.name, err)
+		}
+	}
+	return nil
 }
