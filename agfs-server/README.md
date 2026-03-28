@@ -263,6 +263,8 @@ All API endpoints are prefixed with `/api/v1/`.
 -   `make build`: Build the server binary.
 -   `make test`: Run tests.
 -   `make test-failpoint`: Run failpoint tests.
+-   `make integration-test-pg`: Run `queuefs` PostgreSQL integration tests.
+-   `make integration-test-tidb`: Run TiDB integration tests.
 -   `make dev`: Run the server in development mode.
 -   `make install`: Install the binary to `$GOPATH/bin`.
 
@@ -282,6 +284,30 @@ This target:
 - rewrites the agfs-server source tree with `failpoint-ctl enable`
 - runs `go test -tags failpoint ./...`
 - restores the source tree with `failpoint-ctl disable` on exit
+
+### Running Database Integration Tests
+
+`agfs-server` keeps database integration tests behind DSN-based gates:
+
+- `PG_TEST_DSN` enables PostgreSQL integration tests
+- `TIDB_TEST_DSN` enables TiDB integration tests
+
+Run PostgreSQL integration tests from `agfs/agfs-server` with:
+
+```bash
+PG_TEST_DSN="postgresql://${USER}@127.0.0.1:5432/postgres?sslmode=disable" \
+make integration-test-pg
+```
+
+Run TiDB integration tests from `agfs/agfs-server` with:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://tiup-mirrors.pingcap.com/install.sh | sh
+tiup playground v8.5.5 --tiflash 0 --without-monitor
+
+TIDB_TEST_DSN='root@tcp(127.0.0.1:4000)/queuedb?charset=utf8mb4&parseTime=True' \
+make integration-test-tidb
+```
 
 ## License
 

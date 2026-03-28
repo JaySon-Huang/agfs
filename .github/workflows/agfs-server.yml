@@ -1,4 +1,4 @@
-name: agfs-server
+name: agfs-server ci
 
 on:
   push:
@@ -22,9 +22,12 @@ concurrency:
   group: agfs-server-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  TIDB_VERSION: v8.5.5
+
 jobs:
   tests:
-    name: go test
+    name: agfs-server unit tests
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -35,13 +38,27 @@ jobs:
         with:
           go-version-file: agfs-server/go.mod
 
-      - name: Run Go tests
+      - name: Run agfs-server unit tests
         working-directory: agfs-server
-        run: go test -v ./...
+        run: make test
 
   failpoint-tests:
-    name: failpoint tests
+    name: agfs-server failpoint and integration tests
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d postgres"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -60,6 +77,170 @@ jobs:
         working-directory: agfs-server
         run: go install github.com/pingcap/failpoint/failpoint-ctl@latest
 
-      - name: Run failpoint tests
+      - name: Run agfs-server failpoint tests
         working-directory: agfs-server
-        run: python3 scripts/run_failpoint_tests.py
+        run: make test-failpoint
+
+      - name: Wait for PostgreSQL readiness
+        id: pg-ready
+        continue-on-error: true
+        run: |
+          for _ in {1..30}; do
+            if pg_isready -h 127.0.0.1 -p 5432 -U postgres; then
+              exit 0
+            fi
+            sleep 2
+          done
+          exit 1
+
+      - name: Run PostgreSQL integration tests
+        id: pg-tests
+        if: steps.pg-ready.outcome == 'success'
+        continue-on-error: true
+        working-directory: agfs-server
+        env:
+          PG_TEST_DSN: postgresql://postgres@127.0.0.1:5432/postgres?sslmode=disable
+        run: make integration-test-pg
+
+      - name: Dump PostgreSQL container logs
+        if: always() && (steps.pg-ready.outcome == 'failure' || steps.pg-tests.outcome == 'failure')
+        run: docker logs ${{ job.services.postgres.id }} || true
+
+      - name: Publish PostgreSQL integration test summary
+        if: always()
+        run: |
+          {
+            echo "## PostgreSQL integration tests"
+            echo
+            echo "| Check | Outcome |"
+            echo "| --- | --- |"
+            echo "| PostgreSQL readiness | ${{ steps.pg-ready.outcome }} |"
+            echo "| PostgreSQL integration tests | ${{ steps.pg-tests.outcome || 'skipped' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cache TiUP artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.tiup/bin
+            ~/.tiup/components
+            ~/.tiup/manifests
+            ~/.tiup/manifest
+          key: ${{ runner.os }}-tiup-${{ env.TIDB_VERSION }}
+
+      - name: Install TiUP and TiDB components
+        id: install-tiup
+        continue-on-error: true
+        run: |
+          if [ ! -x "$HOME/.tiup/bin/tiup" ]; then
+            curl --proto '=https' --tlsv1.2 -sSf https://tiup-mirrors.pingcap.com/install.sh | sh
+          fi
+          echo "$HOME/.tiup/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.tiup/bin:$PATH"
+          tiup telemetry disable || true
+          tiup install playground
+          tiup install tidb:${TIDB_VERSION} pd:${TIDB_VERSION} tikv:${TIDB_VERSION}
+          tiup --version
+
+      - name: Start TiDB playground
+        id: tidb-start
+        if: steps.install-tiup.outcome == 'success'
+        continue-on-error: true
+        run: |
+          nohup tiup playground ${TIDB_VERSION} --tiflash 0 --without-monitor > /tmp/tiup-playground.log 2>&1 &
+          echo $! > /tmp/tiup-playground.pid
+
+      - name: Wait for TiDB readiness
+        id: tidb-ready
+        if: steps.tidb-start.outcome == 'success'
+        continue-on-error: true
+        run: |
+          for _ in {1..60}; do
+            if curl -sf http://127.0.0.1:10080/status > /tmp/tidb-status.json; then
+              cat /tmp/tidb-status.json
+              exit 0
+            fi
+            sleep 5
+          done
+          exit 1
+
+      - name: Run TiDB integration tests
+        id: tidb-tests
+        if: steps.tidb-ready.outcome == 'success'
+        continue-on-error: true
+        working-directory: agfs-server
+        env:
+          TIDB_TEST_DSN: root@tcp(127.0.0.1:4000)/queuedb?charset=utf8mb4&parseTime=True
+        run: make integration-test-tidb
+
+      - name: Dump TiDB playground logs
+        if: always() && (steps.tidb-start.outcome == 'failure' || steps.tidb-ready.outcome == 'failure' || steps.tidb-tests.outcome == 'failure')
+        run: |
+          if [ -f /tmp/tiup-playground.log ]; then
+            cat /tmp/tiup-playground.log
+          else
+            echo "TiDB playground log file was not created"
+          fi
+
+      - name: Stop TiDB playground
+        if: always()
+        run: |
+          if [ -f /tmp/tiup-playground.pid ]; then
+            kill "$(cat /tmp/tiup-playground.pid)" || true
+          fi
+
+      - name: Publish TiDB integration test summary
+        if: always()
+        run: |
+          {
+            echo "## TiDB integration tests"
+            echo
+            echo "| Check | Outcome |"
+            echo "| --- | --- |"
+            echo "| TiUP install | ${{ steps.install-tiup.outcome }} |"
+            echo "| TiDB playground start | ${{ steps.tidb-start.outcome || 'skipped' }} |"
+            echo "| TiDB readiness | ${{ steps.tidb-ready.outcome || 'skipped' }} |"
+            echo "| TiDB integration tests | ${{ steps.tidb-tests.outcome || 'skipped' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Enforce PostgreSQL and TiDB integration test results
+        if: always()
+        run: |
+          failed=0
+
+          check_required() {
+            local name="$1"
+            local outcome="$2"
+            if [ "$outcome" != "success" ]; then
+              echo "$name did not succeed (outcome: $outcome)"
+              failed=1
+            fi
+          }
+
+          check_required "PostgreSQL readiness" "${{ steps.pg-ready.outcome }}"
+          if [ "${{ steps.pg-ready.outcome }}" = "success" ]; then
+            check_required "PostgreSQL integration tests" "${{ steps.pg-tests.outcome }}"
+          else
+            echo "PostgreSQL integration tests were skipped because readiness did not succeed"
+          fi
+
+          check_required "TiUP install" "${{ steps.install-tiup.outcome }}"
+          if [ "${{ steps.install-tiup.outcome }}" = "success" ]; then
+            check_required "TiDB playground start" "${{ steps.tidb-start.outcome }}"
+          else
+            echo "TiDB playground start was skipped because TiUP installation did not succeed"
+          fi
+
+          if [ "${{ steps.tidb-start.outcome }}" = "success" ]; then
+            check_required "TiDB readiness" "${{ steps.tidb-ready.outcome }}"
+          else
+            echo "TiDB readiness was skipped because playground startup did not succeed"
+          fi
+
+          if [ "${{ steps.tidb-ready.outcome }}" = "success" ]; then
+            check_required "TiDB integration tests" "${{ steps.tidb-tests.outcome }}"
+          else
+            echo "TiDB integration tests were skipped because readiness did not succeed"
+          fi
+
+          exit "$failed"

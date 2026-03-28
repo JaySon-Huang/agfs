@@ -16,10 +16,6 @@ import (
 func tidbTestConfig(t *testing.T, database string) map[string]interface{} {
 	t.Helper()
 
-	if os.Getenv("TIDB_TEST") == "" {
-		t.Skip("set TIDB_TEST=1 to run TiDB integration tests")
-	}
-
 	dsn := os.Getenv("TIDB_TEST_DSN")
 	if dsn == "" {
 		t.Skip("set TIDB_TEST_DSN to run TiDB integration tests")
@@ -181,10 +177,6 @@ func TestQueueFSTiDBPersistenceRegression(t *testing.T) {
 }
 
 func TestQueueFSTiDBConfigUsesDSN(t *testing.T) {
-	if os.Getenv("TIDB_TEST") == "" {
-		t.Skip("set TIDB_TEST=1 to run TiDB integration tests")
-	}
-
 	config := tidbTestConfig(t, newTiDBTestDatabaseName(t))
 	if _, ok := config["dsn"].(string); !ok || config["dsn"] == "" {
 		t.Fatalf("expected non-empty dsn in config: %+v", config)
