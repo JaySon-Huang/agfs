@@ -285,7 +285,8 @@ func ensurePGDatabase(t *testing.T, adminDSN string, database string) {
 	}
 	defer db.Close()
 
-	if _, err := db.Exec(fmt.Sprintf("CREATE DATABASE %q", database)); err != nil && !strings.Contains(err.Error(), "already exists") {
+	quotedDatabase := `"` + strings.ReplaceAll(database, `"`, `""`) + `"`
+	if _, err := db.Exec(fmt.Sprintf("CREATE DATABASE %s", quotedDatabase)); err != nil && !strings.Contains(err.Error(), "already exists") {
 		t.Fatalf("create database %q: %v", database, err)
 	}
 }
