@@ -1,11 +1,151 @@
 package queuefs
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 )
+
+type durableTestBackend struct {
+	queues            map[string][]QueueMessage
+	lastEnqueueTime   map[string]time.Time
+	claimResponse     ClaimedMessage
+	claimFound        bool
+	statsResponse     QueueStats
+	claimCalls        int
+	dequeueCalls      int
+	recoveriesApplied int
+}
+
+func newDurableTestBackend() *durableTestBackend {
+	now := time.Unix(1711600000, 0).UTC()
+	return &durableTestBackend{
+		queues: map[string][]QueueMessage{
+			"jobs": {{ID: "pending-1", Data: "payload", Timestamp: now}},
+		},
+		lastEnqueueTime: map[string]time.Time{
+			"jobs": now,
+		},
+		claimResponse: ClaimedMessage{
+			MessageID:  "claimed-1",
+			QueueName:  "jobs",
+			Data:       []byte("payload"),
+			Receipt:    "receipt-1",
+			ClaimedAt:  now,
+			LeaseUntil: now.Add(30 * time.Second),
+			Attempt:    1,
+		},
+		claimFound:    true,
+		statsResponse: QueueStats{Pending: 1, Processing: 2, Recoveries: 3},
+	}
+}
+
+func (b *durableTestBackend) Initialize(config map[string]interface{}) error { return nil }
+
+func (b *durableTestBackend) Close() error { return nil }
+
+func (b *durableTestBackend) GetType() string { return "durable-test" }
+
+func (b *durableTestBackend) Enqueue(queueName string, msg QueueMessage) error {
+	b.queues[queueName] = append(b.queues[queueName], msg)
+	b.lastEnqueueTime[queueName] = msg.Timestamp
+	return nil
+}
+
+func (b *durableTestBackend) Dequeue(queueName string) (QueueMessage, bool, error) {
+	b.dequeueCalls++
+	return QueueMessage{}, false, nil
+}
+
+func (b *durableTestBackend) Peek(queueName string) (QueueMessage, bool, error) {
+	queue := b.queues[queueName]
+	if len(queue) == 0 {
+		return QueueMessage{}, false, nil
+	}
+	return queue[0], true, nil
+}
+
+func (b *durableTestBackend) Size(queueName string) (int, error) {
+	return b.statsResponse.Pending, nil
+}
+
+func (b *durableTestBackend) Clear(queueName string) error {
+	b.queues[queueName] = nil
+	b.statsResponse = QueueStats{}
+	return nil
+}
+
+func (b *durableTestBackend) ListQueues(prefix string) ([]string, error) {
+	queues := []string{}
+	for queueName := range b.queues {
+		if prefix == "" || queueName == prefix || strings.HasPrefix(queueName, prefix+"/") {
+			queues = append(queues, queueName)
+		}
+	}
+	return queues, nil
+}
+
+func (b *durableTestBackend) GetLastEnqueueTime(queueName string) (time.Time, error) {
+	return b.lastEnqueueTime[queueName], nil
+}
+
+func (b *durableTestBackend) RemoveQueue(queueName string) error {
+	delete(b.queues, queueName)
+	delete(b.lastEnqueueTime, queueName)
+	return nil
+}
+
+func (b *durableTestBackend) CreateQueue(queueName string) error {
+	if _, ok := b.queues[queueName]; !ok {
+		b.queues[queueName] = nil
+	}
+	return nil
+}
+
+func (b *durableTestBackend) QueueExists(queueName string) (bool, error) {
+	_, exists := b.queues[queueName]
+	return exists, nil
+}
+
+func (b *durableTestBackend) Claim(queueName string, req ClaimRequest) (ClaimedMessage, bool, error) {
+	b.claimCalls++
+	return b.claimResponse, b.claimFound, nil
+}
+
+func (b *durableTestBackend) Ack(queueName string, messageID string, receipt string) error {
+	return nil
+}
+
+func (b *durableTestBackend) Release(queueName string, messageID string, req ReleaseRequest) error {
+	return nil
+}
+
+func (b *durableTestBackend) RecoverExpired(queueName string, now time.Time, limit int) (int, error) {
+	b.recoveriesApplied++
+	return b.recoveriesApplied, nil
+}
+
+func (b *durableTestBackend) Stats(queueName string) (QueueStats, error) {
+	return b.statsResponse, nil
+}
+
+func newDurableTestQueueFS(t *testing.T) (*queueFS, *durableTestBackend) {
+	t.Helper()
+
+	plugin := NewQueueFSPlugin()
+	backend := newDurableTestBackend()
+	plugin.backend = backend
+	plugin.mode = queueModeDurable
+
+	fs, ok := plugin.GetFileSystem().(*queueFS)
+	if !ok {
+		t.Fatalf("unexpected filesystem type %T", plugin.GetFileSystem())
+	}
+	return fs, backend
+}
 
 func TestQueueFSDefaultModeIsFIFO(t *testing.T) {
 	fs := newConfiguredTestQueueFS(t, map[string]interface{}{"backend": "memory"})
@@ -25,22 +165,36 @@ func TestQueueFSDefaultModeIsFIFO(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readdir /jobs: %v", err)
 	}
-	if _, ok := queueDirEntryNames(entries)["ack"]; ok {
-		t.Fatalf("fifo mode should not expose ack control file: %+v", entries)
+	files := queueDirEntryNames(entries)
+	if _, ok := files["peek"]; !ok {
+		t.Fatalf("fifo mode missing peek control file in %+v", entries)
+	}
+	for _, name := range []string{"ack", "recover", "stats"} {
+		if _, ok := files[name]; ok {
+			t.Fatalf("fifo mode should not expose %q in %+v", name, entries)
+		}
 	}
 	if _, err := fs.Stat("/jobs/ack"); err == nil || !strings.Contains(err.Error(), "no such file") {
 		t.Fatalf("stat /jobs/ack error = %v, want missing path", err)
 	}
-	if _, err := fs.OpenHandle("/jobs/ack", filesystem.O_WRONLY, 0); err == nil || !strings.Contains(err.Error(), "unknown operation") {
-		t.Fatalf("open fifo ack handle error = %v, want unknown operation", err)
+	if _, err := fs.OpenHandle("/jobs/recover", filesystem.O_WRONLY, 0); err == nil || !strings.Contains(err.Error(), "unknown operation") {
+		t.Fatalf("open fifo recover handle error = %v, want unknown operation", err)
 	}
 }
 
-func TestQueueFSDurableModeExposesAckControlFile(t *testing.T) {
-	fs := newConfiguredTestQueueFS(t, map[string]interface{}{
+func TestQueueFSDurableModeRequiresDurableBackend(t *testing.T) {
+	plugin := NewQueueFSPlugin()
+	err := plugin.Initialize(map[string]interface{}{
 		"backend": "memory",
 		"mode":    queueModeDurable,
 	})
+	if err == nil || !strings.Contains(err.Error(), "DurableQueueBackend") {
+		t.Fatalf("initialize durable memory backend error = %v, want DurableQueueBackend requirement", err)
+	}
+}
+
+func TestQueueFSDurableModeExposesDurableOnlySurface(t *testing.T) {
+	fs, _ := newDurableTestQueueFS(t)
 
 	rootInfo, err := fs.Stat("/")
 	if err != nil {
@@ -50,45 +204,78 @@ func TestQueueFSDurableModeExposesAckControlFile(t *testing.T) {
 		t.Fatalf("root mode = %q, want %q", got, queueModeDurable)
 	}
 
-	if err := fs.Mkdir("/jobs", 0o755); err != nil {
-		t.Fatalf("mkdir /jobs: %v", err)
-	}
 	entries, err := fs.ReadDir("/jobs")
 	if err != nil {
 		t.Fatalf("readdir /jobs: %v", err)
 	}
 	files := queueDirEntryNames(entries)
-	ack, ok := files["ack"]
-	if !ok {
-		t.Fatalf("durable mode missing ack control file in %+v", entries)
+	if len(files) != 7 {
+		t.Fatalf("unexpected durable control files: %+v", entries)
 	}
-	if ack.Mode != 0o222 {
-		t.Fatalf("ack mode = %#o, want 0222", ack.Mode)
+	for _, name := range []string{"enqueue", "dequeue", "size", "stats", "clear", "ack", "recover"} {
+		if _, ok := files[name]; !ok {
+			t.Fatalf("durable mode missing %q in %+v", name, entries)
+		}
 	}
-	if ack.Meta.Type != MetaValueQueueControl {
-		t.Fatalf("ack meta type = %q, want %q", ack.Meta.Type, MetaValueQueueControl)
+	if _, ok := files["peek"]; ok {
+		t.Fatalf("durable mode should not expose peek in %+v", entries)
+	}
+	if got := files["stats"].Mode; got != 0o444 {
+		t.Fatalf("stats mode = %#o, want 0444", got)
+	}
+	if got := files["stats"].Meta.Type; got != MetaValueQueueStatus {
+		t.Fatalf("stats meta type = %q, want %q", got, MetaValueQueueStatus)
+	}
+	if got := files["recover"].Mode; got != 0o222 {
+		t.Fatalf("recover mode = %#o, want 0222", got)
 	}
 
-	info, err := fs.Stat("/jobs/ack")
-	if err != nil {
-		t.Fatalf("stat /jobs/ack: %v", err)
+	if _, err := fs.Stat("/jobs/peek"); err == nil || !strings.Contains(err.Error(), "no such file") {
+		t.Fatalf("stat /jobs/peek error = %v, want missing path", err)
 	}
-	if info.Mode != 0o222 {
-		t.Fatalf("ack stat mode = %#o, want 0222", info.Mode)
+	if _, err := fs.OpenHandle("/jobs/peek", filesystem.O_RDONLY, 0); err == nil || !strings.Contains(err.Error(), "unknown operation") {
+		t.Fatalf("open durable peek handle error = %v, want unknown operation", err)
+	}
+	if _, err := fs.Read("/jobs/recover", 0, -1); err == nil || !strings.Contains(err.Error(), "write-only") {
+		t.Fatalf("read /jobs/recover error = %v, want write-only", err)
+	}
+	if _, err := fs.Write("/jobs/recover", nil, -1, filesystem.WriteFlagAppend); err == nil || !strings.Contains(err.Error(), "not implemented") {
+		t.Fatalf("write /jobs/recover error = %v, want not implemented", err)
+	}
+}
+
+func TestQueueFSDurableModeMapsDequeueToClaimAndStats(t *testing.T) {
+	fs, backend := newDurableTestQueueFS(t)
+
+	claimedBytes := mustReadAll(t, fs, "/jobs/dequeue")
+	var claimed ClaimedMessage
+	if err := json.Unmarshal(claimedBytes, &claimed); err != nil {
+		t.Fatalf("unmarshal durable dequeue payload: %v (payload=%q)", err, string(claimedBytes))
+	}
+	if claimed.MessageID != backend.claimResponse.MessageID {
+		t.Fatalf("claimed message_id = %q, want %q", claimed.MessageID, backend.claimResponse.MessageID)
+	}
+	if claimed.Receipt != backend.claimResponse.Receipt {
+		t.Fatalf("claimed receipt = %q, want %q", claimed.Receipt, backend.claimResponse.Receipt)
+	}
+	if backend.claimCalls != 1 {
+		t.Fatalf("claim calls = %d, want 1", backend.claimCalls)
+	}
+	if backend.dequeueCalls != 0 {
+		t.Fatalf("dequeue calls = %d, want 0", backend.dequeueCalls)
 	}
 
-	if _, err := fs.Read("/jobs/ack", 0, -1); err == nil || !strings.Contains(err.Error(), "write-only") {
-		t.Fatalf("read /jobs/ack error = %v, want write-only", err)
+	statsBytes := mustReadAll(t, fs, "/jobs/stats")
+	var stats QueueStats
+	if err := json.Unmarshal(statsBytes, &stats); err != nil {
+		t.Fatalf("unmarshal durable stats payload: %v (payload=%q)", err, string(statsBytes))
 	}
-	handle, err := fs.OpenHandle("/jobs/ack", filesystem.O_WRONLY, 0)
-	if err != nil {
-		t.Fatalf("open durable ack handle: %v", err)
+	if stats != backend.statsResponse {
+		t.Fatalf("stats = %+v, want %+v", stats, backend.statsResponse)
 	}
-	t.Cleanup(func() { _ = handle.Close() })
-	if handle.Flags() != filesystem.O_WRONLY {
-		t.Fatalf("ack handle flags = %v, want O_WRONLY", handle.Flags())
-	}
-	if _, err := handle.Write([]byte("msg-id")); err == nil || !strings.Contains(err.Error(), "not implemented") {
-		t.Fatalf("write ack handle error = %v, want not implemented", err)
+
+	sizeBytes := mustReadAll(t, fs, "/jobs/size")
+	if got := string(sizeBytes); got != "1" {
+		t.Fatalf("durable size payload = %q, want pending count 1", got)
 	}
 }

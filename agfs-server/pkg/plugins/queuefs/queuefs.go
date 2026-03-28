@@ -78,12 +78,20 @@ func (q *QueueFSPlugin) Initialize(cfg map[string]interface{}) error {
 		return err
 	}
 
+	mode := queueFSMode(cfg)
+
 	if err := backend.Initialize(cfg); err != nil {
 		return fmt.Errorf("failed to initialize %s backend: %w", backendType, err)
 	}
+	if mode == queueModeDurable {
+		if _, ok := backend.(DurableQueueBackend); !ok {
+			_ = backend.Close()
+			return fmt.Errorf("failed to initialize %s backend: durable mode requires DurableQueueBackend support", backendType)
+		}
+	}
 
 	q.backend = backend
-	q.mode = queueFSMode(cfg)
+	q.mode = mode
 
 	log.Infof("[queuefs] Initialized with backend: %s", backendType)
 	return nil
@@ -345,8 +353,10 @@ var allQueueOperations = map[string]bool{
 	"dequeue": true,
 	"peek":    true,
 	"size":    true,
+	"stats":   true,
 	"clear":   true,
 	"ack":     true,
+	"recover": true,
 }
 
 func (q *QueueFSPlugin) queueMode() string {
@@ -357,17 +367,32 @@ func (q *QueueFSPlugin) queueMode() string {
 }
 
 func (qfs *queueFS) queueOperations() map[string]bool {
-	ops := map[string]bool{
+	if qfs.plugin.queueMode() == queueModeDurable {
+		return map[string]bool{
+			"enqueue": true,
+			"dequeue": true,
+			"size":    true,
+			"stats":   true,
+			"clear":   true,
+			"ack":     true,
+			"recover": true,
+		}
+	}
+	return map[string]bool{
 		"enqueue": true,
 		"dequeue": true,
 		"peek":    true,
 		"size":    true,
 		"clear":   true,
 	}
-	if qfs.plugin.queueMode() == queueModeDurable {
-		ops["ack"] = true
+}
+
+func (q *QueueFSPlugin) durableBackend() (DurableQueueBackend, bool) {
+	if q.backend == nil {
+		return nil, false
 	}
-	return ops
+	durableBackend, ok := q.backend.(DurableQueueBackend)
+	return durableBackend, ok
 }
 
 // parseQueuePath parses a path like "/queue_name/operation" or "/dir/queue_name/operation"
@@ -516,7 +541,9 @@ func (qfs *queueFS) Read(path string, offset int64, size int64) ([]byte, error) 
 		data, err = qfs.peek(queueName)
 	case "size":
 		data, err = qfs.size(queueName)
-	case "enqueue", "clear", "ack":
+	case "stats":
+		data, err = qfs.stats(queueName)
+	case "enqueue", "clear", "ack", "recover":
 		// Write-only files
 		return []byte(""), fmt.Errorf("permission denied: %s is write-only", path)
 	default:
@@ -565,6 +592,8 @@ func (qfs *queueFS) Write(path string, data []byte, offset int64, flags filesyst
 		return 0, nil
 	case "ack":
 		return 0, fmt.Errorf("not implemented: durable ack is not supported yet")
+	case "recover":
+		return 0, fmt.Errorf("not implemented: durable recover is not supported yet")
 	default:
 		return 0, fmt.Errorf("cannot write to: %s", path)
 	}
@@ -718,14 +747,6 @@ func (qfs *queueFS) getQueueControlFiles(queueName string, now time.Time) ([]fil
 			Meta:    filesystem.MetaData{Name: PluginName, Type: MetaValueQueueControl},
 		},
 		{
-			Name:    "peek",
-			Size:    0,
-			Mode:    0444,            // read-only
-			ModTime: lastEnqueueTime, // Use last enqueue time for poll offset tracking
-			IsDir:   false,
-			Meta:    filesystem.MetaData{Name: PluginName, Type: MetaValueQueueControl},
-		},
-		{
 			Name:    "size",
 			Size:    int64(len(strconv.Itoa(queueSize))),
 			Mode:    0444, // read-only
@@ -744,10 +765,35 @@ func (qfs *queueFS) getQueueControlFiles(queueName string, now time.Time) ([]fil
 	}
 	if qfs.plugin.queueMode() == queueModeDurable {
 		files = append(files, filesystem.FileInfo{
+			Name:    "stats",
+			Size:    0,
+			Mode:    0444, // read-only
+			ModTime: now,
+			IsDir:   false,
+			Meta:    filesystem.MetaData{Name: PluginName, Type: MetaValueQueueStatus},
+		})
+		files = append(files, filesystem.FileInfo{
 			Name:    "ack",
 			Size:    0,
 			Mode:    0222, // write-only
 			ModTime: now,
+			IsDir:   false,
+			Meta:    filesystem.MetaData{Name: PluginName, Type: MetaValueQueueControl},
+		})
+		files = append(files, filesystem.FileInfo{
+			Name:    "recover",
+			Size:    0,
+			Mode:    0222, // write-only
+			ModTime: now,
+			IsDir:   false,
+			Meta:    filesystem.MetaData{Name: PluginName, Type: MetaValueQueueControl},
+		})
+	} else {
+		files = append(files, filesystem.FileInfo{
+			Name:    "peek",
+			Size:    0,
+			Mode:    0444,            // read-only
+			ModTime: lastEnqueueTime, // Use last enqueue time for poll offset tracking
 			IsDir:   false,
 			Meta:    filesystem.MetaData{Name: PluginName, Type: MetaValueQueueControl},
 		})
@@ -850,7 +896,7 @@ func (qfs *queueFS) Stat(path string) (*filesystem.FileInfo, error) {
 	}
 
 	mode := uint32(0644)
-	if operation == "enqueue" || operation == "clear" || operation == "ack" {
+	if operation == "enqueue" || operation == "clear" || operation == "ack" || operation == "recover" {
 		mode = 0222
 	} else {
 		mode = 0444
@@ -864,6 +910,8 @@ func (qfs *queueFS) Stat(path string) (*filesystem.FileInfo, error) {
 		fileType = MetaValueQueueStatus
 		queueSize, _ := qfs.plugin.backend.Size(queueName)
 		size = int64(len(strconv.Itoa(queueSize)))
+	} else if operation == "stats" {
+		fileType = MetaValueQueueStatus
 	} else if operation == "peek" {
 		// Use last enqueue time for peek's ModTime
 		lastEnqueueTime, err := qfs.plugin.backend.GetLastEnqueueTime(queueName)
@@ -954,6 +1002,26 @@ func (qfs *queueFS) enqueue(queueName string, data []byte) ([]byte, error) {
 }
 
 func (qfs *queueFS) dequeue(queueName string) ([]byte, error) {
+	if qfs.plugin.queueMode() == queueModeDurable {
+		qfs.plugin.mu.Lock()
+		defer qfs.plugin.mu.Unlock()
+
+		durableBackend, ok := qfs.plugin.durableBackend()
+		if !ok {
+			return nil, fmt.Errorf("durable queue backend is not available")
+		}
+
+		msg, found, err := durableBackend.Claim(queueName, ClaimRequest{})
+		if err != nil {
+			return nil, err
+		}
+		if !found {
+			return []byte("{}"), nil
+		}
+
+		return json.Marshal(msg)
+	}
+
 	qfs.plugin.mu.Lock()
 	defer qfs.plugin.mu.Unlock()
 
@@ -971,6 +1039,10 @@ func (qfs *queueFS) dequeue(queueName string) ([]byte, error) {
 }
 
 func (qfs *queueFS) peek(queueName string) ([]byte, error) {
+	if qfs.plugin.queueMode() == queueModeDurable {
+		return nil, fmt.Errorf("peek is not available in durable mode")
+	}
+
 	qfs.plugin.mu.RLock()
 	defer qfs.plugin.mu.RUnlock()
 
@@ -999,6 +1071,23 @@ func (qfs *queueFS) size(queueName string) ([]byte, error) {
 	return []byte(strconv.Itoa(count)), nil
 }
 
+func (qfs *queueFS) stats(queueName string) ([]byte, error) {
+	qfs.plugin.mu.RLock()
+	defer qfs.plugin.mu.RUnlock()
+
+	durableBackend, ok := qfs.plugin.durableBackend()
+	if !ok {
+		return nil, fmt.Errorf("durable queue backend is not available")
+	}
+
+	stats, err := durableBackend.Stats(queueName)
+	if err != nil {
+		return nil, err
+	}
+
+	return json.Marshal(stats)
+}
+
 func (qfs *queueFS) clear(queueName string) error {
 	qfs.plugin.mu.Lock()
 	defer qfs.plugin.mu.Unlock()
@@ -1021,7 +1110,7 @@ type queueFileHandle struct {
 	qfs       *queueFS
 	path      string
 	queueName string
-	operation string // "enqueue", "dequeue", "peek", "size", "clear"
+	operation string // queue control file name
 	flags     filesystem.OpenFlag
 
 	// For dequeue/peek: cached message data (read once, return from cache)
@@ -1143,7 +1232,9 @@ func (h *queueFileHandle) Read(buf []byte) (int, error) {
 			data, err = h.qfs.peek(h.queueName)
 		case "size":
 			data, err = h.qfs.size(h.queueName)
-		case "enqueue", "clear", "ack":
+		case "stats":
+			data, err = h.qfs.stats(h.queueName)
+		case "enqueue", "clear", "ack", "recover":
 			// These are write-only operations
 			return 0, io.EOF
 		default:
@@ -1184,7 +1275,9 @@ func (h *queueFileHandle) ReadAt(buf []byte, offset int64) (int, error) {
 			data, err = h.qfs.peek(h.queueName)
 		case "size":
 			data, err = h.qfs.size(h.queueName)
-		case "enqueue", "clear", "ack":
+		case "stats":
+			data, err = h.qfs.stats(h.queueName)
+		case "enqueue", "clear", "ack", "recover":
 			// These are write-only operations
 			return 0, io.EOF
 		default:
@@ -1231,7 +1324,9 @@ func (h *queueFileHandle) WriteAt(data []byte, offset int64) (int, error) {
 		return len(data), nil
 	case "ack":
 		return 0, fmt.Errorf("not implemented: durable ack is not supported yet")
-	case "dequeue", "peek", "size":
+	case "recover":
+		return 0, fmt.Errorf("not implemented: durable recover is not supported yet")
+	case "dequeue", "peek", "size", "stats":
 		return 0, fmt.Errorf("cannot write to %s", h.operation)
 	default:
 		return 0, fmt.Errorf("unsupported write operation: %s", h.operation)
