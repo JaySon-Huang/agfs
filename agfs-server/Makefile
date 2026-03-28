@@ -1,4 +1,4 @@
-.PHONY: all build run test clean install help lint deps test-failpoint
+.PHONY: all build run test clean install help lint deps test-failpoint integration-test-pg integration-test-tidb
 
 # Variables
 BINARY_NAME=agfs-server
@@ -44,6 +44,14 @@ test: ## Run all tests
 test-failpoint: ## Run agfs-server failpoint tests
 	@echo "Running failpoint tests..."
 	./scripts/run_failpoint_tests.py
+
+integration-test-pg: ## Run queuefs PostgreSQL integration tests
+	@echo "Running queuefs PostgreSQL integration tests..."
+	$(GO) test -v ./pkg/plugins/queuefs -run 'TestQueueFSPGSQL' -count=1
+
+integration-test-tidb: ## Run TiDB integration tests
+	@echo "==> queuefs TiDB integration tests"
+	$(GO) test -v ./pkg/plugins/queuefs -run 'TestQueueFSTiDB' -count=1
 
 lint: ## Run golangci-lint (requires golangci-lint to be installed)
 	@echo "Running golangci-lint..."

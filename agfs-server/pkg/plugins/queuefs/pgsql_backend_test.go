@@ -15,10 +15,6 @@ import (
 func pgTestConfig(t *testing.T, database string) map[string]interface{} {
 	t.Helper()
 
-	if os.Getenv("PG_TEST") == "" {
-		t.Skip("set PG_TEST=1 to run PostgreSQL integration tests")
-	}
-
 	dsn := os.Getenv("PG_TEST_DSN")
 	if dsn == "" {
 		t.Skip("set PG_TEST_DSN to run PostgreSQL integration tests")
@@ -197,10 +193,6 @@ func TestQueueFSPGSQLPersistenceRegression(t *testing.T) {
 }
 
 func TestQueueFSPGSQLConfigUsesDSN(t *testing.T) {
-	if os.Getenv("PG_TEST") == "" {
-		t.Skip("set PG_TEST=1 to run PostgreSQL integration tests")
-	}
-
 	config := pgTestConfig(t, newPGTestDatabaseName())
 	if _, ok := config["dsn"].(string); !ok || config["dsn"] == "" {
 		t.Fatalf("expected non-empty dsn in config: %+v", config)

@@ -80,6 +80,13 @@ go test ./pkg/plugins/queuefs/...
 This covers the default in-memory tests plus the local SQLite-backed regression tests.
 TiDB and PostgreSQL integration tests are gated separately and only run when explicitly enabled.
 
+The supported integration-test entrypoints are:
+
+```bash
+make integration-test-pg
+make integration-test-tidb
+```
+
 ## Running SQLite Tests
 
 `queuefs` includes regression tests that exercise the real SQLite-backed implementation.
@@ -114,14 +121,12 @@ tiup playground v8.5.5 --tiflash 0 --without-monitor
 From `agfs/agfs-server`, run:
 
 ```bash
-TIDB_TEST=1 \
 TIDB_TEST_DSN='root@tcp(127.0.0.1:4000)/queuedb?charset=utf8mb4&parseTime=True' \
-go test ./pkg/plugins/queuefs -run 'TestQueueFSTiDB' -count=1 -v
+make integration-test-tidb
 ```
 
 Notes:
 
-- The TiDB tests are skipped unless `TIDB_TEST=1` is set.
 - `TIDB_TEST_DSN` is required; the tests replace the database name in that DSN with a fresh per-test database.
 - The tests create a fresh database name for each run, so they do not reuse prior queue tables.
 - The current TiDB regression coverage lives in `agfs-server/pkg/plugins/queuefs/tidb_backend_test.go`.
@@ -135,14 +140,12 @@ The default PostgreSQL service is available at `127.0.0.1:5432`.
 From `agfs/agfs-server`, run:
 
 ```bash
-PG_TEST=1 \
 PG_TEST_DSN="postgresql://${USER}@127.0.0.1:5432/postgres?sslmode=disable" \
-go test ./pkg/plugins/queuefs -run 'TestQueueFSPGSQL' -count=1 -v
+make integration-test-pg
 ```
 
 Notes:
 
-- The PostgreSQL tests are skipped unless `PG_TEST=1` is set.
 - `PG_TEST_DSN` is required; the tests replace the database name in that DSN with a fresh per-test database.
 - The tests create a fresh database name for each run, so they do not reuse prior queue tables.
 - The current PostgreSQL regression coverage lives in `agfs-server/pkg/plugins/queuefs/pgsql_backend_test.go`.
