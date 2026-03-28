@@ -98,6 +98,8 @@ type ReleaseRequest struct {
 }
 
 // QueueStats captures durable queue-level state counts.
+// Recoveries is a historical queue-level counter rather than a count of only
+// the messages that are still pending or processing.
 type QueueStats struct {
 	Pending    int `json:"pending"`
 	Processing int `json:"processing"`

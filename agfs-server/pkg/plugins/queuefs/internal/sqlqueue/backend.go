@@ -801,7 +801,9 @@ func (b *Backend) Stats(queueName string) (model.QueueStats, error) {
 	}
 
 	var recoveries sql.NullInt64
-	recoveriesQuery := fmt.Sprintf("SELECT COALESCE(SUM(recovery_count), 0) FROM %s WHERE deleted = %s", tableName, b.boolLiteral(false))
+	// Recoveries is defined as a queue-level historical counter, so acked rows
+	// continue contributing their recovery_count after they leave the live set.
+	recoveriesQuery := fmt.Sprintf("SELECT COALESCE(SUM(recovery_count), 0) FROM %s", tableName)
 	if err := b.db.QueryRow(recoveriesQuery).Scan(&recoveries); err != nil {
 		return model.QueueStats{}, fmt.Errorf("failed to get recovery stats: %w", err)
 	}

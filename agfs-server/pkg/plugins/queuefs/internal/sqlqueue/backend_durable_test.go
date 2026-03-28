@@ -109,6 +109,13 @@ func TestSQLiteBackendDurableLifecycle(t *testing.T) {
 	if err := backend.Ack(queueName, reclaimedAfterRecover.MessageID, reclaimedAfterRecover.Receipt); err != nil {
 		t.Fatalf("ack recovered message: %v", err)
 	}
+	stats, err = backend.Stats(queueName)
+	if err != nil {
+		t.Fatalf("stats after recovered ack: %v", err)
+	}
+	if stats.Pending != 0 || stats.Processing != 0 || stats.Recoveries != 1 {
+		t.Fatalf("stats after recovered ack = %+v, want pending=0 processing=0 recoveries=1", stats)
+	}
 }
 
 func TestSQLiteBackendDurableRecoveryAfterRestart(t *testing.T) {
@@ -116,20 +123,29 @@ func TestSQLiteBackendDurableRecoveryAfterRestart(t *testing.T) {
 	queueName := "jobs"
 	now := time.Unix(1711600000, 0).UTC()
 
-	func() {
-		backend := newSQLiteDurableTestBackend(t, dbPath)
-		if err := backend.CreateQueue(queueName); err != nil {
-			t.Fatalf("create queue: %v", err)
-		}
-		if err := backend.Enqueue(queueName, model.QueueMessage{ID: "restart", Data: "restart", Timestamp: now}); err != nil {
-			t.Fatalf("enqueue restart message: %v", err)
-		}
-		if _, found, err := backend.Claim(queueName, model.ClaimRequest{LeaseDuration: time.Second}); err != nil {
-			t.Fatalf("claim restart message: %v", err)
-		} else if !found {
-			t.Fatal("expected claimed message before restart")
-		}
-	}()
+	// This test needs a real close-and-reopen cycle, so do not reuse the helper
+	// that defers backend.Close() until the end of the whole test.
+	firstBackend := NewSQLiteBackend()
+	if err := firstBackend.Initialize(map[string]interface{}{
+		"backend": "sqlite",
+		"db_path": dbPath,
+	}); err != nil {
+		t.Fatalf("initialize first sqlite backend: %v", err)
+	}
+	if err := firstBackend.CreateQueue(queueName); err != nil {
+		t.Fatalf("create queue: %v", err)
+	}
+	if err := firstBackend.Enqueue(queueName, model.QueueMessage{ID: "restart", Data: "restart", Timestamp: now}); err != nil {
+		t.Fatalf("enqueue restart message: %v", err)
+	}
+	if _, found, err := firstBackend.Claim(queueName, model.ClaimRequest{LeaseDuration: time.Second}); err != nil {
+		t.Fatalf("claim restart message: %v", err)
+	} else if !found {
+		t.Fatal("expected claimed message before restart")
+	}
+	if err := firstBackend.Close(); err != nil {
+		t.Fatalf("close first sqlite backend: %v", err)
+	}
 
 	backend := newSQLiteDurableTestBackend(t, dbPath)
 	recovered, err := backend.RecoverExpired(queueName, time.Now().UTC().Add(2*time.Second), 0)

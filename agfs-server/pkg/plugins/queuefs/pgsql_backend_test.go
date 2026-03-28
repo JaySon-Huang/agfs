@@ -449,4 +449,16 @@ func TestQueueFSPGSQLDurableLifecycle(t *testing.T) {
 	if !found || reclaimed.MessageID != claim.MessageID || reclaimed.Attempt != claim.Attempt+1 {
 		t.Fatalf("unexpected reclaimed durable pgsql message: found=%v claimed=%+v", found, reclaimed)
 	}
+	ackPayload = []byte(`{"message_id":"` + reclaimed.MessageID + `","receipt":"` + reclaimed.Receipt + `"}`)
+	if _, err := fs.Write("/jobs/ack", ackPayload, -1, 0); err != nil {
+		t.Fatalf("ack recovered durable pgsql message: %v", err)
+	}
+	statsBytes := mustReadAll(t, fs, "/jobs/stats")
+	var stats QueueStats
+	if err := json.Unmarshal(statsBytes, &stats); err != nil {
+		t.Fatalf("unmarshal durable pgsql stats after recovered ack: %v (payload=%q)", err, string(statsBytes))
+	}
+	if stats.Pending != 0 || stats.Processing != 0 || stats.Recoveries != 1 {
+		t.Fatalf("durable pgsql stats after recovered ack = %+v, want pending=0 processing=0 recoveries=1", stats)
+	}
 }
