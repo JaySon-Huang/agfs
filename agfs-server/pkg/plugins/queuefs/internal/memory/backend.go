@@ -16,6 +16,7 @@ type Queue struct {
 
 // Backend implements QueueBackend using in-memory storage.
 type Backend struct {
+	mu     sync.RWMutex
 	queues map[string]*Queue
 }
 
@@ -31,6 +32,9 @@ func (b *Backend) Initialize(config map[string]interface{}) error {
 }
 
 func (b *Backend) Close() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	b.queues = nil
 	return nil
 }
@@ -40,6 +44,9 @@ func (b *Backend) GetType() string {
 }
 
 func (b *Backend) getOrCreateQueue(queueName string) *Queue {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	if queue, exists := b.queues[queueName]; exists {
 		return queue
 	}
@@ -69,7 +76,9 @@ func (b *Backend) Enqueue(queueName string, msg model.QueueMessage) error {
 }
 
 func (b *Backend) Dequeue(queueName string) (model.QueueMessage, bool, error) {
+	b.mu.RLock()
 	queue, exists := b.queues[queueName]
+	b.mu.RUnlock()
 	if !exists {
 		return model.QueueMessage{}, false, nil
 	}
@@ -87,7 +96,9 @@ func (b *Backend) Dequeue(queueName string) (model.QueueMessage, bool, error) {
 }
 
 func (b *Backend) Peek(queueName string) (model.QueueMessage, bool, error) {
+	b.mu.RLock()
 	queue, exists := b.queues[queueName]
+	b.mu.RUnlock()
 	if !exists {
 		return model.QueueMessage{}, false, nil
 	}
@@ -103,7 +114,9 @@ func (b *Backend) Peek(queueName string) (model.QueueMessage, bool, error) {
 }
 
 func (b *Backend) Size(queueName string) (int, error) {
+	b.mu.RLock()
 	queue, exists := b.queues[queueName]
+	b.mu.RUnlock()
 	if !exists {
 		return 0, nil
 	}
@@ -115,7 +128,9 @@ func (b *Backend) Size(queueName string) (int, error) {
 }
 
 func (b *Backend) Clear(queueName string) error {
+	b.mu.RLock()
 	queue, exists := b.queues[queueName]
+	b.mu.RUnlock()
 	if !exists {
 		return nil
 	}
@@ -129,6 +144,9 @@ func (b *Backend) Clear(queueName string) error {
 }
 
 func (b *Backend) ListQueues(prefix string) ([]string, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
 	var queues []string
 	for qName := range b.queues {
 		if prefix == "" || qName == prefix || len(qName) > len(prefix) && qName[:len(prefix)+1] == prefix+"/" {
@@ -139,7 +157,9 @@ func (b *Backend) ListQueues(prefix string) ([]string, error) {
 }
 
 func (b *Backend) GetLastEnqueueTime(queueName string) (time.Time, error) {
+	b.mu.RLock()
 	queue, exists := b.queues[queueName]
+	b.mu.RUnlock()
 	if !exists {
 		return time.Time{}, nil
 	}
@@ -151,6 +171,9 @@ func (b *Backend) GetLastEnqueueTime(queueName string) (time.Time, error) {
 }
 
 func (b *Backend) RemoveQueue(queueName string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	// Remove the queue and all nested queues.
 	if queueName == "" {
 		b.queues = make(map[string]*Queue)
@@ -176,6 +199,9 @@ func (b *Backend) CreateQueue(queueName string) error {
 }
 
 func (b *Backend) QueueExists(queueName string) (bool, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
 	_, exists := b.queues[queueName]
 	return exists, nil
 }
