@@ -52,6 +52,14 @@ integration-test-pg: ## Run queuefs PostgreSQL integration tests
 integration-test-tidb: ## Run TiDB integration tests
 	@echo "==> queuefs TiDB integration tests"
 	$(GO) test -v ./pkg/plugins/queuefs -run 'TestQueueFSTiDB' -count=1
+	# Keep the vectorfs TiDB step here, but do not run it yet.
+	# Current blockers observed in local validation:
+	# 1. vectorfs expects TIDB_TEST_DSN to point at an existing database, unlike
+	#    queuefs which rewrites the DB name per test and creates it on demand.
+	# 2. vectorfs TiDB namespace creation currently fails on TiDB with
+	#    "Specified key was too long" for idx_file_name on VARCHAR(1024).
+	# @echo "==> vectorfs TiDB integration tests"
+	# $(GO) test -v ./pkg/plugins/vectorfs -run 'TestTiDB' -count=1
 
 lint: ## Run golangci-lint (requires golangci-lint to be installed)
 	@echo "Running golangci-lint..."
