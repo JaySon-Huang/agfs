@@ -8,6 +8,7 @@ import (
 
 var queueFSAllowedConfigKeys = []string{
 	"backend", "mount_path",
+	"mode",
 	"db_path", "dsn", "admin_dsn", "user", "password", "host", "port", "database",
 	"enable_tls", "tls_server_name", "tls_skip_verify",
 }
@@ -27,6 +28,10 @@ func queueFSBackendType(cfg map[string]interface{}) string {
 	return config.GetStringConfig(cfg, "backend", "memory")
 }
 
+func queueFSMode(cfg map[string]interface{}) string {
+	return config.GetStringConfig(cfg, "mode", queueModeFIFO)
+}
+
 func validateQueueFSConfig(cfg map[string]interface{}) error {
 	if err := config.ValidateOnlyKnownKeys(cfg, queueFSAllowedConfigKeys); err != nil {
 		return err
@@ -34,10 +39,17 @@ func validateQueueFSConfig(cfg map[string]interface{}) error {
 	if err := config.ValidateStringType(cfg, "backend"); err != nil {
 		return err
 	}
+	if err := config.ValidateStringType(cfg, "mode"); err != nil {
+		return err
+	}
 
 	backendType := queueFSBackendType(cfg)
 	if !queueFSValidBackends[backendType] {
 		return fmt.Errorf("unsupported backend: %s (valid options: memory, tidb/mysql, pgsql/postgres/postgresql, sqlite/sqlite3)", backendType)
+	}
+	mode := queueFSMode(cfg)
+	if mode != queueModeFIFO && mode != queueModeDurable {
+		return fmt.Errorf("unsupported queue mode: %s (valid options: %s, %s)", mode, queueModeFIFO, queueModeDurable)
 	}
 
 	if backendType == "memory" {

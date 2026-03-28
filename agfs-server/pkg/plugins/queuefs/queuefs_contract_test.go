@@ -22,9 +22,14 @@ func mustReadAll(t *testing.T, fs filesystem.FileSystem, path string) []byte {
 
 func newTestQueueFS(t *testing.T) *queueFS {
 	t.Helper()
+	return newConfiguredTestQueueFS(t, map[string]interface{}{"backend": "memory"})
+}
+
+func newConfiguredTestQueueFS(t *testing.T, cfg map[string]interface{}) *queueFS {
+	t.Helper()
 
 	plugin := NewQueueFSPlugin()
-	if err := plugin.Initialize(map[string]interface{}{"backend": "memory"}); err != nil {
+	if err := plugin.Initialize(cfg); err != nil {
 		t.Fatalf("initialize queuefs: %v", err)
 	}
 	t.Cleanup(func() {
