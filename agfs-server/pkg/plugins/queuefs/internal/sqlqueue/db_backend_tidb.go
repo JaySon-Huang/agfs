@@ -18,6 +18,7 @@ func NewTiDBDBBackend() *TiDBDBBackend { return &TiDBDBBackend{} }
 
 func (b *TiDBDBBackend) Open(cfg map[string]interface{}) (*sql.DB, error) {
 	dsnStr := config.GetStringConfig(cfg, "dsn", "")
+	database := config.GetStringConfig(cfg, "database", "")
 	dsnHasTLS := strings.Contains(dsnStr, "tls=")
 	enableTLS := config.GetBoolConfig(cfg, "enable_tls", false) || dsnHasTLS
 	tlsConfigName := "tidb-queuefs"
@@ -50,38 +51,58 @@ func (b *TiDBDBBackend) Open(cfg map[string]interface{}) (*sql.DB, error) {
 	}
 
 	var dsn string
+	var dsnWithoutDB string
 	if dsnStr != "" {
-		dsn = dsnStr
+		parsedDSN, err := mysql.ParseDSN(dsnStr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse TiDB DSN: %w", err)
+		}
+		if database == "" {
+			database = parsedDSN.DBName
+		}
+		if database == "" {
+			database = "queuedb"
+		}
+		// Keep config precedence stable: when both dsn and database are provided,
+		// the explicit database setting must win so create/open target the same DB.
+		if parsedDSN.DBName != database {
+			parsedDSN.DBName = database
+		}
+		dsn = parsedDSN.FormatDSN()
+		adminDSN := *parsedDSN
+		adminDSN.DBName = ""
+		dsnWithoutDB = adminDSN.FormatDSN()
 	} else {
 		user := config.GetStringConfig(cfg, "user", "root")
 		password := config.GetStringConfig(cfg, "password", "")
 		host := config.GetStringConfig(cfg, "host", "127.0.0.1")
 		port := config.GetStringConfig(cfg, "port", "4000")
-		database := config.GetStringConfig(cfg, "database", "queuedb")
+		if database == "" {
+			database = "queuedb"
+		}
 		if password != "" {
 			dsn = fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?charset=utf8mb4&parseTime=True", user, password, host, port, database)
+			dsnWithoutDB = fmt.Sprintf("%s:%s@tcp(%s:%s)/?charset=utf8mb4&parseTime=True", user, password, host, port)
 		} else {
 			dsn = fmt.Sprintf("%s@tcp(%s:%s)/%s?charset=utf8mb4&parseTime=True", user, host, port, database)
+			dsnWithoutDB = fmt.Sprintf("%s@tcp(%s:%s)/?charset=utf8mb4&parseTime=True", user, host, port)
 		}
 		if enableTLS {
 			dsn += fmt.Sprintf("&tls=%s", tlsConfigName)
+			dsnWithoutDB += fmt.Sprintf("&tls=%s", tlsConfigName)
 		}
 	}
 
 	log.Infof("[queuefs] Connecting to TiDB (TLS: %v)", enableTLS)
-	dbName := extractDatabaseName(dsn, config.GetStringConfig(cfg, "database", ""))
-	if dbName != "" {
-		dsnWithoutDB := removeDatabaseFromDSN(dsn)
-		if dsnWithoutDB != dsn {
-			tempDB, err := sql.Open("mysql", dsnWithoutDB)
-			if err == nil {
-				defer tempDB.Close()
-				_, err = tempDB.Exec(fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", dbName))
-				if err != nil {
-					log.Warnf("[queuefs] Failed to create database '%s': %v", dbName, err)
-				} else {
-					log.Infof("[queuefs] Database '%s' created or already exists", dbName)
-				}
+	if database != "" && dsnWithoutDB != "" && dsnWithoutDB != dsn {
+		tempDB, err := sql.Open("mysql", dsnWithoutDB)
+		if err == nil {
+			defer tempDB.Close()
+			_, err = tempDB.Exec(fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", database))
+			if err != nil {
+				log.Warnf("[queuefs] Failed to create database '%s': %v", database, err)
+			} else {
+				log.Infof("[queuefs] Database '%s' created or already exists", database)
 			}
 		}
 	}

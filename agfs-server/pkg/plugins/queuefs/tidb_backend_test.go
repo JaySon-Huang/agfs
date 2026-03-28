@@ -1,11 +1,13 @@
 package queuefs
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -61,6 +63,12 @@ func newTiDBTestDatabaseName(t *testing.T) string {
 	t.Helper()
 
 	return fmt.Sprintf("queuefs_test_%d", time.Now().UnixNano())
+}
+
+func newTiDBNamedDatabaseName(t *testing.T, suffix string) string {
+	t.Helper()
+
+	return fmt.Sprintf("queuefs_test_%d_%s", time.Now().UnixNano(), suffix)
 }
 
 func TestQueueFSTiDBFileRegression(t *testing.T) {
@@ -181,6 +189,96 @@ func TestQueueFSTiDBConfigUsesDSN(t *testing.T) {
 	if _, ok := config["dsn"].(string); !ok || config["dsn"] == "" {
 		t.Fatalf("expected non-empty dsn in config: %+v", config)
 	}
+}
+
+func TestQueueFSTiDBConfigDatabaseOverridesDSN(t *testing.T) {
+	baseDSN := os.Getenv("TIDB_TEST_DSN")
+	if baseDSN == "" {
+		t.Skip("set TIDB_TEST_DSN to run TiDB integration tests")
+	}
+
+	parsedDSN, err := mysql.ParseDSN(baseDSN)
+	if err != nil {
+		t.Fatalf("parse TIDB_TEST_DSN: %v", err)
+	}
+	if parsedDSN.Params == nil {
+		parsedDSN.Params = map[string]string{}
+	}
+
+	dsnDatabase := newTiDBNamedDatabaseName(t, "dsn")
+	targetDatabase := newTiDBNamedDatabaseName(t, "target")
+	ensureTiDBDatabase(t, parsedDSN, dsnDatabase)
+	ensureTiDBDatabase(t, parsedDSN, targetDatabase)
+
+	dsnConfig := *parsedDSN
+	dsnConfig.DBName = dsnDatabase
+	dsnURL := dsnConfig.FormatDSN()
+
+	plugin := NewQueueFSPlugin()
+	if err := plugin.Initialize(map[string]interface{}{
+		"backend":  "tidb",
+		"dsn":      dsnURL,
+		"database": targetDatabase,
+	}); err != nil {
+		t.Fatalf("initialize tidb queuefs with overridden database: %v", err)
+	}
+	t.Cleanup(func() {
+		if plugin.backend != nil {
+			_ = plugin.backend.Close()
+		}
+	})
+
+	fs, ok := plugin.GetFileSystem().(*queueFS)
+	if !ok {
+		t.Fatalf("unexpected filesystem type %T", plugin.GetFileSystem())
+	}
+	if err := fs.Mkdir("/jobs", 0o755); err != nil {
+		t.Fatalf("mkdir /jobs: %v", err)
+	}
+
+	if got := tidbQueueRegistryCount(t, parsedDSN, targetDatabase); got != 1 {
+		t.Fatalf("target database queue registry count = %d, want 1", got)
+	}
+	if got := tidbQueueRegistryCount(t, parsedDSN, dsnDatabase); got != 0 {
+		t.Fatalf("dsn database queue registry count = %d, want 0", got)
+	}
+}
+
+func ensureTiDBDatabase(t *testing.T, baseDSN *mysql.Config, database string) {
+	t.Helper()
+
+	adminDSN := *baseDSN
+	adminDSN.DBName = ""
+	db, err := sql.Open("mysql", adminDSN.FormatDSN())
+	if err != nil {
+		t.Fatalf("open TiDB admin connection: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", database)); err != nil {
+		t.Fatalf("create TiDB database %q: %v", database, err)
+	}
+}
+
+func tidbQueueRegistryCount(t *testing.T, baseDSN *mysql.Config, database string) int {
+	t.Helper()
+
+	dsn := *baseDSN
+	dsn.DBName = database
+	db, err := sql.Open("mysql", dsn.FormatDSN())
+	if err != nil {
+		t.Fatalf("open TiDB database %q: %v", database, err)
+	}
+	defer db.Close()
+
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM queuefs_registry`).Scan(&count); err != nil {
+		if strings.Contains(err.Error(), "doesn't exist") {
+			return 0
+		}
+		t.Fatalf("count queuefs_registry rows in %q: %v", database, err)
+	}
+	return count
 }
 
 func TestQueueFSTiDBConcurrentDequeueRegression(t *testing.T) {

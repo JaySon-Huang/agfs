@@ -78,6 +78,11 @@ func (b *PostgreSQLDBBackend) Open(cfg map[string]interface{}) (*sql.DB, error) 
 	}
 	if database == "" {
 		database = "queuedb"
+	}
+	// Keep config precedence stable: when both dsn and database are provided,
+	// the explicit database setting must win so admin/create and final connect
+	// target the same database instead of silently keeping the DSN path.
+	if targetConnConfig.Database != database {
 		targetConnConfig.Database = database
 		targetDSN = stdlib.RegisterConnConfig(targetConnConfig)
 	}
