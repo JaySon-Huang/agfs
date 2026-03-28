@@ -41,9 +41,25 @@ func tidbTestConfig(t *testing.T, database string) map[string]interface{} {
 
 func newTiDBTestQueueFS(t *testing.T, database string) *queueFS {
 	t.Helper()
+	plugin := newTiDBTestPluginWithConfig(t, database, nil)
+
+	fs, ok := plugin.GetFileSystem().(*queueFS)
+	if !ok {
+		t.Fatalf("unexpected filesystem type %T", plugin.GetFileSystem())
+	}
+	return fs
+}
+
+func newTiDBTestPluginWithConfig(t *testing.T, database string, extra map[string]interface{}) *QueueFSPlugin {
+	t.Helper()
+
+	cfg := tidbTestConfig(t, database)
+	for key, value := range extra {
+		cfg[key] = value
+	}
 
 	plugin := NewQueueFSPlugin()
-	if err := plugin.Initialize(tidbTestConfig(t, database)); err != nil {
+	if err := plugin.Initialize(cfg); err != nil {
 		t.Fatalf("initialize tidb queuefs: %v", err)
 	}
 	t.Cleanup(func() {
@@ -51,12 +67,7 @@ func newTiDBTestQueueFS(t *testing.T, database string) *queueFS {
 			_ = plugin.backend.Close()
 		}
 	})
-
-	fs, ok := plugin.GetFileSystem().(*queueFS)
-	if !ok {
-		t.Fatalf("unexpected filesystem type %T", plugin.GetFileSystem())
-	}
-	return fs
+	return plugin
 }
 
 func newTiDBTestDatabaseName(t *testing.T) string {
@@ -339,5 +350,64 @@ func TestQueueFSTiDBConcurrentDequeueRegression(t *testing.T) {
 	}
 	if got := string(mustReadAll(t, writerFS, "/jobs/size")); got != "0" {
 		t.Fatalf("queue size after concurrent dequeue = %q, want 0", got)
+	}
+}
+
+func TestQueueFSTiDBDurableLifecycle(t *testing.T) {
+	database := newTiDBTestDatabaseName(t)
+	plugin := newTiDBTestPluginWithConfig(t, database, map[string]interface{}{"mode": queueModeDurable})
+	fs, ok := plugin.GetFileSystem().(*queueFS)
+	if !ok {
+		t.Fatalf("unexpected filesystem type %T", plugin.GetFileSystem())
+	}
+
+	if err := fs.Mkdir("/jobs", 0o755); err != nil {
+		t.Fatalf("mkdir /jobs: %v", err)
+	}
+	if _, err := fs.Write("/jobs/enqueue", []byte("tidb-durable"), -1, 0); err != nil {
+		t.Fatalf("enqueue durable tidb message: %v", err)
+	}
+
+	claimedBytes := mustReadAll(t, fs, "/jobs/dequeue")
+	var claimed ClaimedMessage
+	if err := json.Unmarshal(claimedBytes, &claimed); err != nil {
+		t.Fatalf("unmarshal durable tidb claim: %v (payload=%q)", err, string(claimedBytes))
+	}
+	if got := string(claimed.Data); got != "tidb-durable" {
+		t.Fatalf("claimed durable tidb data = %q, want tidb-durable", got)
+	}
+	ackPayload := []byte(`{"message_id":"` + claimed.MessageID + `","receipt":"` + claimed.Receipt + `"}`)
+	if _, err := fs.Write("/jobs/ack", ackPayload, -1, 0); err != nil {
+		t.Fatalf("ack durable tidb message: %v", err)
+	}
+	if got := string(mustReadAll(t, fs, "/jobs/size")); got != "0" {
+		t.Fatalf("durable tidb size after ack = %q, want 0", got)
+	}
+
+	durableBackend, ok := plugin.backend.(DurableQueueBackend)
+	if !ok {
+		t.Fatal("tidb backend should implement DurableQueueBackend")
+	}
+	if _, err := fs.Write("/jobs/enqueue", []byte("recover-tidb"), -1, 0); err != nil {
+		t.Fatalf("enqueue recover tidb message: %v", err)
+	}
+	claim, found, err := durableBackend.Claim("jobs", ClaimRequest{LeaseDuration: time.Second})
+	if err != nil {
+		t.Fatalf("claim recover tidb message: %v", err)
+	}
+	if !found {
+		t.Fatal("expected recover tidb message to be claimed")
+	}
+	if recovered, err := durableBackend.RecoverExpired("jobs", time.Now().UTC().Add(2*time.Second), 0); err != nil {
+		t.Fatalf("recover durable tidb message: %v", err)
+	} else if recovered != 1 {
+		t.Fatalf("recovered durable tidb count = %d, want 1", recovered)
+	}
+	reclaimed, found, err := durableBackend.Claim("jobs", ClaimRequest{})
+	if err != nil {
+		t.Fatalf("reclaim durable tidb message: %v", err)
+	}
+	if !found || reclaimed.MessageID != claim.MessageID || reclaimed.Attempt != claim.Attempt+1 {
+		t.Fatalf("unexpected reclaimed durable tidb message: found=%v claimed=%+v", found, reclaimed)
 	}
 }

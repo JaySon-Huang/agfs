@@ -1,15 +1,34 @@
 package memory
 
 import (
+	"fmt"
 	"sync"
 	"time"
 
 	model "github.com/c4pt0r/agfs/agfs-server/pkg/plugins/queuefs/internal"
+	"github.com/google/uuid"
 )
+
+const defaultLeaseDuration = 30 * time.Second
+
+type queueItem struct {
+	message       model.QueueMessage
+	attempt       int
+	recoveryCount int
+}
+
+type claimedItem struct {
+	item       queueItem
+	receipt    string
+	claimedAt  time.Time
+	leaseUntil time.Time
+}
 
 // Queue represents a single message queue for the memory backend.
 type Queue struct {
-	messages        []model.QueueMessage
+	pending         []queueItem
+	processing      map[string]claimedItem
+	recoveries      int
 	mu              sync.Mutex
 	lastEnqueueTime time.Time // Tracks the timestamp of the most recently enqueued message
 }
@@ -51,7 +70,8 @@ func (b *Backend) getOrCreateQueue(queueName string) *Queue {
 		return queue
 	}
 	queue := &Queue{
-		messages:        []model.QueueMessage{},
+		pending:         []queueItem{},
+		processing:      make(map[string]claimedItem),
 		lastEnqueueTime: time.Time{},
 	}
 	b.queues[queueName] = queue
@@ -63,7 +83,7 @@ func (b *Backend) Enqueue(queueName string, msg model.QueueMessage) error {
 	queue.mu.Lock()
 	defer queue.mu.Unlock()
 
-	queue.messages = append(queue.messages, msg)
+	queue.pending = append(queue.pending, queueItem{message: msg})
 
 	// Update lastEnqueueTime.
 	if msg.Timestamp.After(queue.lastEnqueueTime) {
@@ -86,13 +106,13 @@ func (b *Backend) Dequeue(queueName string) (model.QueueMessage, bool, error) {
 	queue.mu.Lock()
 	defer queue.mu.Unlock()
 
-	if len(queue.messages) == 0 {
+	if len(queue.pending) == 0 {
 		return model.QueueMessage{}, false, nil
 	}
 
-	msg := queue.messages[0]
-	queue.messages = queue.messages[1:]
-	return msg, true, nil
+	item := queue.pending[0]
+	queue.pending = queue.pending[1:]
+	return item.message, true, nil
 }
 
 func (b *Backend) Peek(queueName string) (model.QueueMessage, bool, error) {
@@ -106,11 +126,11 @@ func (b *Backend) Peek(queueName string) (model.QueueMessage, bool, error) {
 	queue.mu.Lock()
 	defer queue.mu.Unlock()
 
-	if len(queue.messages) == 0 {
+	if len(queue.pending) == 0 {
 		return model.QueueMessage{}, false, nil
 	}
 
-	return queue.messages[0], true, nil
+	return queue.pending[0].message, true, nil
 }
 
 func (b *Backend) Size(queueName string) (int, error) {
@@ -124,7 +144,7 @@ func (b *Backend) Size(queueName string) (int, error) {
 	queue.mu.Lock()
 	defer queue.mu.Unlock()
 
-	return len(queue.messages), nil
+	return len(queue.pending), nil
 }
 
 func (b *Backend) Clear(queueName string) error {
@@ -138,7 +158,9 @@ func (b *Backend) Clear(queueName string) error {
 	queue.mu.Lock()
 	defer queue.mu.Unlock()
 
-	queue.messages = []model.QueueMessage{}
+	queue.pending = []queueItem{}
+	queue.processing = make(map[string]claimedItem)
+	queue.recoveries = 0
 	queue.lastEnqueueTime = time.Time{}
 	return nil
 }
@@ -204,4 +226,154 @@ func (b *Backend) QueueExists(queueName string) (bool, error) {
 
 	_, exists := b.queues[queueName]
 	return exists, nil
+}
+
+func (b *Backend) Claim(queueName string, req model.ClaimRequest) (model.ClaimedMessage, bool, error) {
+	b.mu.RLock()
+	queue, exists := b.queues[queueName]
+	b.mu.RUnlock()
+	if !exists {
+		return model.ClaimedMessage{}, false, nil
+	}
+
+	queue.mu.Lock()
+	defer queue.mu.Unlock()
+
+	if len(queue.pending) == 0 {
+		return model.ClaimedMessage{}, false, nil
+	}
+
+	item := queue.pending[0]
+	queue.pending = queue.pending[1:]
+	item.attempt++
+
+	leaseDuration := req.LeaseDuration
+	if leaseDuration <= 0 {
+		leaseDuration = defaultLeaseDuration
+	}
+	claimedAt := time.Now().UTC()
+	receipt := uuid.NewString()
+	claimed := claimedItem{
+		item:       item,
+		receipt:    receipt,
+		claimedAt:  claimedAt,
+		leaseUntil: claimedAt.Add(leaseDuration),
+	}
+	queue.processing[item.message.ID] = claimed
+
+	return model.ClaimedMessage{
+		MessageID:  item.message.ID,
+		QueueName:  queueName,
+		Data:       []byte(item.message.Data),
+		Receipt:    receipt,
+		ClaimedAt:  claimedAt,
+		LeaseUntil: claimed.leaseUntil,
+		Attempt:    item.attempt,
+	}, true, nil
+}
+
+func (b *Backend) Ack(queueName string, messageID string, receipt string) error {
+	claimed, queue, err := b.requireClaim(queueName, messageID, receipt)
+	if err != nil {
+		return err
+	}
+
+	queue.mu.Lock()
+	defer queue.mu.Unlock()
+	if current, ok := queue.processing[messageID]; !ok || current.receipt != receipt {
+		return fmt.Errorf("claim is no longer active for message %q", messageID)
+	}
+	delete(queue.processing, messageID)
+	_ = claimed
+	return nil
+}
+
+func (b *Backend) Release(queueName string, messageID string, req model.ReleaseRequest) error {
+	claimed, queue, err := b.requireClaim(queueName, messageID, req.Receipt)
+	if err != nil {
+		return err
+	}
+
+	queue.mu.Lock()
+	defer queue.mu.Unlock()
+	if current, ok := queue.processing[messageID]; !ok || current.receipt != req.Receipt {
+		return fmt.Errorf("claim is no longer active for message %q", messageID)
+	}
+	delete(queue.processing, messageID)
+	queue.pending = append([]queueItem{claimed.item}, queue.pending...)
+	return nil
+}
+
+func (b *Backend) RecoverExpired(queueName string, now time.Time, limit int) (int, error) {
+	b.mu.RLock()
+	queue, exists := b.queues[queueName]
+	b.mu.RUnlock()
+	if !exists {
+		return 0, nil
+	}
+
+	queue.mu.Lock()
+	defer queue.mu.Unlock()
+
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	recovered := 0
+	toPrepend := make([]queueItem, 0)
+	for messageID, claimed := range queue.processing {
+		if limit > 0 && recovered >= limit {
+			break
+		}
+		if claimed.leaseUntil.After(now) {
+			continue
+		}
+		delete(queue.processing, messageID)
+		item := claimed.item
+		item.recoveryCount++
+		toPrepend = append(toPrepend, item)
+		recovered++
+	}
+	for i := len(toPrepend) - 1; i >= 0; i-- {
+		queue.pending = append([]queueItem{toPrepend[i]}, queue.pending...)
+	}
+	queue.recoveries += recovered
+	return recovered, nil
+}
+
+func (b *Backend) Stats(queueName string) (model.QueueStats, error) {
+	b.mu.RLock()
+	queue, exists := b.queues[queueName]
+	b.mu.RUnlock()
+	if !exists {
+		return model.QueueStats{}, nil
+	}
+
+	queue.mu.Lock()
+	defer queue.mu.Unlock()
+
+	return model.QueueStats{
+		Pending:    len(queue.pending),
+		Processing: len(queue.processing),
+		Recoveries: queue.recoveries,
+	}, nil
+}
+
+func (b *Backend) requireClaim(queueName string, messageID string, receipt string) (claimedItem, *Queue, error) {
+	b.mu.RLock()
+	queue, exists := b.queues[queueName]
+	b.mu.RUnlock()
+	if !exists {
+		return claimedItem{}, nil, fmt.Errorf("queue does not exist: %s", queueName)
+	}
+
+	queue.mu.Lock()
+	claimed, ok := queue.processing[messageID]
+	queue.mu.Unlock()
+	if !ok {
+		return claimedItem{}, nil, fmt.Errorf("message %q is not currently claimed", messageID)
+	}
+	if claimed.receipt != receipt {
+		return claimedItem{}, nil, fmt.Errorf("invalid receipt for message %q", messageID)
+	}
+	return claimed, queue, nil
 }

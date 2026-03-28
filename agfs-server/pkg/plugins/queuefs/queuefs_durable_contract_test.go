@@ -17,6 +17,10 @@ type durableTestBackend struct {
 	statsResponse     QueueStats
 	claimCalls        int
 	dequeueCalls      int
+	ackCalls          int
+	lastAckMessageID  string
+	lastAckReceipt    string
+	lastRecoverLimit  int
 	recoveriesApplied int
 }
 
@@ -116,6 +120,9 @@ func (b *durableTestBackend) Claim(queueName string, req ClaimRequest) (ClaimedM
 }
 
 func (b *durableTestBackend) Ack(queueName string, messageID string, receipt string) error {
+	b.ackCalls++
+	b.lastAckMessageID = messageID
+	b.lastAckReceipt = receipt
 	return nil
 }
 
@@ -124,6 +131,7 @@ func (b *durableTestBackend) Release(queueName string, messageID string, req Rel
 }
 
 func (b *durableTestBackend) RecoverExpired(queueName string, now time.Time, limit int) (int, error) {
+	b.lastRecoverLimit = limit
 	b.recoveriesApplied++
 	return b.recoveriesApplied, nil
 }
@@ -182,17 +190,6 @@ func TestQueueFSDefaultModeIsFIFO(t *testing.T) {
 	}
 }
 
-func TestQueueFSDurableModeRequiresDurableBackend(t *testing.T) {
-	plugin := NewQueueFSPlugin()
-	err := plugin.Initialize(map[string]interface{}{
-		"backend": "memory",
-		"mode":    queueModeDurable,
-	})
-	if err == nil || !strings.Contains(err.Error(), "DurableQueueBackend") {
-		t.Fatalf("initialize durable memory backend error = %v, want DurableQueueBackend requirement", err)
-	}
-}
-
 func TestQueueFSDurableModeExposesDurableOnlySurface(t *testing.T) {
 	fs, _ := newDurableTestQueueFS(t)
 
@@ -239,8 +236,8 @@ func TestQueueFSDurableModeExposesDurableOnlySurface(t *testing.T) {
 	if _, err := fs.Read("/jobs/recover", 0, -1); err == nil || !strings.Contains(err.Error(), "write-only") {
 		t.Fatalf("read /jobs/recover error = %v, want write-only", err)
 	}
-	if _, err := fs.Write("/jobs/recover", nil, -1, filesystem.WriteFlagAppend); err == nil || !strings.Contains(err.Error(), "not implemented") {
-		t.Fatalf("write /jobs/recover error = %v, want not implemented", err)
+	if _, err := fs.Write("/jobs/recover", []byte("{"), -1, filesystem.WriteFlagAppend); err == nil || !strings.Contains(err.Error(), "invalid durable recover payload") {
+		t.Fatalf("write /jobs/recover error = %v, want invalid payload", err)
 	}
 }
 
@@ -277,5 +274,119 @@ func TestQueueFSDurableModeMapsDequeueToClaimAndStats(t *testing.T) {
 	sizeBytes := mustReadAll(t, fs, "/jobs/size")
 	if got := string(sizeBytes); got != "1" {
 		t.Fatalf("durable size payload = %q, want pending count 1", got)
+	}
+}
+
+func TestQueueFSDurableModeMapsAckAndRecoverWrites(t *testing.T) {
+	fs, backend := newDurableTestQueueFS(t)
+
+	ackPayload := []byte(`{"message_id":"claimed-1","receipt":"receipt-1"}`)
+	if _, err := fs.Write("/jobs/ack", ackPayload, -1, filesystem.WriteFlagAppend); err != nil {
+		t.Fatalf("write /jobs/ack: %v", err)
+	}
+	if backend.ackCalls != 1 {
+		t.Fatalf("ack calls = %d, want 1", backend.ackCalls)
+	}
+	if backend.lastAckMessageID != "claimed-1" || backend.lastAckReceipt != "receipt-1" {
+		t.Fatalf("ack payload = (%q, %q), want (claimed-1, receipt-1)", backend.lastAckMessageID, backend.lastAckReceipt)
+	}
+
+	recoverPayload := []byte(`{"limit":5}`)
+	if _, err := fs.Write("/jobs/recover", recoverPayload, -1, filesystem.WriteFlagAppend); err != nil {
+		t.Fatalf("write /jobs/recover: %v", err)
+	}
+	if backend.recoveriesApplied != 1 {
+		t.Fatalf("recover calls = %d, want 1", backend.recoveriesApplied)
+	}
+	if backend.lastRecoverLimit != 5 {
+		t.Fatalf("recover limit = %d, want 5", backend.lastRecoverLimit)
+	}
+
+	if _, err := fs.Write("/jobs/ack", []byte(`{"message_id":"claimed-1"}`), -1, filesystem.WriteFlagAppend); err == nil || !strings.Contains(err.Error(), "message_id and receipt are required") {
+		t.Fatalf("write /jobs/ack missing receipt error = %v, want validation error", err)
+	}
+}
+
+func TestQueueFSDurableMemoryLifecycle(t *testing.T) {
+	plugin := newConfiguredTestPlugin(t, map[string]interface{}{
+		"backend": "memory",
+		"mode":    queueModeDurable,
+	})
+	fs, ok := plugin.GetFileSystem().(*queueFS)
+	if !ok {
+		t.Fatalf("unexpected filesystem type %T", plugin.GetFileSystem())
+	}
+
+	if err := fs.Mkdir("/jobs", 0o755); err != nil {
+		t.Fatalf("mkdir /jobs: %v", err)
+	}
+	if _, err := fs.Write("/jobs/enqueue", []byte("first"), -1, filesystem.WriteFlagAppend); err != nil {
+		t.Fatalf("enqueue durable message: %v", err)
+	}
+
+	claimedBytes := mustReadAll(t, fs, "/jobs/dequeue")
+	var claimed ClaimedMessage
+	if err := json.Unmarshal(claimedBytes, &claimed); err != nil {
+		t.Fatalf("unmarshal durable claim: %v (payload=%q)", err, string(claimedBytes))
+	}
+	if got := string(claimed.Data); got != "first" {
+		t.Fatalf("claimed data = %q, want first", got)
+	}
+	if claimed.Receipt == "" {
+		t.Fatal("claimed receipt should not be empty")
+	}
+
+	statsBytes := mustReadAll(t, fs, "/jobs/stats")
+	var stats QueueStats
+	if err := json.Unmarshal(statsBytes, &stats); err != nil {
+		t.Fatalf("unmarshal durable stats: %v (payload=%q)", err, string(statsBytes))
+	}
+	if stats.Pending != 0 || stats.Processing != 1 {
+		t.Fatalf("stats after claim = %+v, want pending=0 processing=1", stats)
+	}
+
+	ackPayload := []byte(`{"message_id":"` + claimed.MessageID + `","receipt":"` + claimed.Receipt + `"}`)
+	if _, err := fs.Write("/jobs/ack", ackPayload, -1, filesystem.WriteFlagAppend); err != nil {
+		t.Fatalf("ack durable message: %v", err)
+	}
+	statsBytes = mustReadAll(t, fs, "/jobs/stats")
+	if err := json.Unmarshal(statsBytes, &stats); err != nil {
+		t.Fatalf("unmarshal durable stats after ack: %v (payload=%q)", err, string(statsBytes))
+	}
+	if stats != (QueueStats{}) {
+		t.Fatalf("stats after ack = %+v, want zero values", stats)
+	}
+
+	durableBackend, ok := plugin.backend.(DurableQueueBackend)
+	if !ok {
+		t.Fatal("memory backend should implement DurableQueueBackend")
+	}
+	if _, err := fs.Write("/jobs/enqueue", []byte("recover-me"), -1, filesystem.WriteFlagAppend); err != nil {
+		t.Fatalf("enqueue recovery message: %v", err)
+	}
+	claimedAgain, found, err := durableBackend.Claim("jobs", ClaimRequest{LeaseDuration: time.Second})
+	if err != nil {
+		t.Fatalf("claim via durable backend: %v", err)
+	}
+	if !found {
+		t.Fatal("expected durable backend claim to find queued message")
+	}
+	if recovered, err := durableBackend.RecoverExpired("jobs", time.Now().UTC().Add(2*time.Second), 0); err != nil {
+		t.Fatalf("recover expired claim: %v", err)
+	} else if recovered != 1 {
+		t.Fatalf("recovered count = %d, want 1", recovered)
+	}
+	claimedAfterRecover, found, err := durableBackend.Claim("jobs", ClaimRequest{})
+	if err != nil {
+		t.Fatalf("claim after recover: %v", err)
+	}
+	if !found {
+		t.Fatal("expected recovered message to become claimable again")
+	}
+	if claimedAfterRecover.MessageID != claimedAgain.MessageID {
+		t.Fatalf("reclaimed message_id = %q, want %q", claimedAfterRecover.MessageID, claimedAgain.MessageID)
+	}
+	if claimedAfterRecover.Attempt != claimedAgain.Attempt+1 {
+		t.Fatalf("reclaimed attempt = %d, want %d", claimedAfterRecover.Attempt, claimedAgain.Attempt+1)
 	}
 }

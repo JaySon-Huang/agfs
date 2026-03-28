@@ -1,18 +1,29 @@
 package queuefs
 
 import (
+	"encoding/json"
 	"path/filepath"
 	"testing"
 )
 
 func newSQLiteTestPlugin(t *testing.T, dbPath string) *QueueFSPlugin {
 	t.Helper()
+	return newSQLiteTestPluginWithConfig(t, dbPath, nil)
+}
 
-	plugin := NewQueueFSPlugin()
-	if err := plugin.Initialize(map[string]interface{}{
+func newSQLiteTestPluginWithConfig(t *testing.T, dbPath string, extra map[string]interface{}) *QueueFSPlugin {
+	t.Helper()
+
+	cfg := map[string]interface{}{
 		"backend": "sqlite",
 		"db_path": dbPath,
-	}); err != nil {
+	}
+	for key, value := range extra {
+		cfg[key] = value
+	}
+
+	plugin := NewQueueFSPlugin()
+	if err := plugin.Initialize(cfg); err != nil {
 		t.Fatalf("initialize sqlite queuefs: %v", err)
 	}
 	t.Cleanup(func() {
@@ -145,5 +156,54 @@ func TestQueueFSSQLitePersistenceRegression(t *testing.T) {
 
 	if _, err := fs.Stat("/jobs"); err != nil {
 		t.Fatalf("stat empty queue after reopen: %v", err)
+	}
+}
+
+func TestQueueFSSQLiteDurableLifecycle(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "queuefs-durable.db")
+	plugin := newSQLiteTestPluginWithConfig(t, dbPath, map[string]interface{}{"mode": queueModeDurable})
+	fs, ok := plugin.GetFileSystem().(*queueFS)
+	if !ok {
+		t.Fatalf("unexpected filesystem type %T", plugin.GetFileSystem())
+	}
+
+	if err := fs.Mkdir("/jobs", 0o755); err != nil {
+		t.Fatalf("mkdir /jobs: %v", err)
+	}
+	if _, err := fs.Write("/jobs/enqueue", []byte("sqlite-durable"), -1, 0); err != nil {
+		t.Fatalf("enqueue durable sqlite message: %v", err)
+	}
+
+	claimedBytes := mustReadAll(t, fs, "/jobs/dequeue")
+	var claimed ClaimedMessage
+	if err := json.Unmarshal(claimedBytes, &claimed); err != nil {
+		t.Fatalf("unmarshal durable sqlite claim: %v (payload=%q)", err, string(claimedBytes))
+	}
+	if got := string(claimed.Data); got != "sqlite-durable" {
+		t.Fatalf("claimed durable sqlite data = %q, want sqlite-durable", got)
+	}
+
+	statsBytes := mustReadAll(t, fs, "/jobs/stats")
+	var stats QueueStats
+	if err := json.Unmarshal(statsBytes, &stats); err != nil {
+		t.Fatalf("unmarshal durable sqlite stats: %v (payload=%q)", err, string(statsBytes))
+	}
+	if stats.Pending != 0 || stats.Processing != 1 {
+		t.Fatalf("durable sqlite stats after claim = %+v, want pending=0 processing=1", stats)
+	}
+
+	ackPayload := []byte(`{"message_id":"` + claimed.MessageID + `","receipt":"` + claimed.Receipt + `"}`)
+	if _, err := fs.Write("/jobs/ack", ackPayload, -1, 0); err != nil {
+		t.Fatalf("ack durable sqlite message: %v", err)
+	}
+	if got := string(mustReadAll(t, fs, "/jobs/size")); got != "0" {
+		t.Fatalf("durable sqlite size after ack = %q, want 0", got)
+	}
+	statsBytes = mustReadAll(t, fs, "/jobs/stats")
+	if err := json.Unmarshal(statsBytes, &stats); err != nil {
+		t.Fatalf("unmarshal durable sqlite stats after ack: %v (payload=%q)", err, string(statsBytes))
+	}
+	if stats != (QueueStats{}) {
+		t.Fatalf("durable sqlite stats after ack = %+v, want zero values", stats)
 	}
 }

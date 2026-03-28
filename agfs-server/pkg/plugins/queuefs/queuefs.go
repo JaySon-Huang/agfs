@@ -112,10 +112,18 @@ STRUCTURE:
     README          - This documentation
     <queue_name>/   - A queue directory
       enqueue       - Write-only file to enqueue messages
-      dequeue       - Read-only file to dequeue messages
-      peek          - Read-only file to peek at next message
-      size          - Read-only file showing queue size
+      dequeue       - Read-only file to dequeue or claim a message
+      size          - Read-only file showing pending queue size
       clear         - Write-only file to clear all messages
+
+MODES:
+  fifo (default):
+      peek          - Read-only file to peek at next message
+
+  durable:
+      ack           - Write-only file to acknowledge a claimed message
+      recover       - Write-only file to recover expired claims
+      stats         - Read-only file showing pending/processing/recoveries
 
 WORKFLOW:
   1. Create a queue:
@@ -125,19 +133,22 @@ WORKFLOW:
      echo "your message" > /queuefs/my_queue/enqueue
 
   3. Dequeue messages:
-     cat /queuefs/my_queue/dequeue
+      cat /queuefs/my_queue/dequeue
 
   4. Check queue size:
-     cat /queuefs/my_queue/size
+      cat /queuefs/my_queue/size
 
-  5. Peek without removing:
-     cat /queuefs/my_queue/peek
+  5. Peek without removing (fifo mode):
+      cat /queuefs/my_queue/peek
 
-  6. Clear the queue:
-     echo "" > /queuefs/my_queue/clear
+  6. Acknowledge a durable claim (durable mode):
+     echo '{"message_id":"...","receipt":"..."}' > /queuefs/my_queue/ack
 
-  7. Delete the queue:
-     rm -rf /queuefs/my_queue
+  7. Clear the queue:
+      echo "" > /queuefs/my_queue/clear
+
+  8. Delete the queue:
+      rm -rf /queuefs/my_queue
 
 NESTED QUEUES:
   You can create queues in nested directories:
@@ -591,9 +602,15 @@ func (qfs *queueFS) Write(path string, data []byte, offset int64, flags filesyst
 		}
 		return 0, nil
 	case "ack":
-		return 0, fmt.Errorf("not implemented: durable ack is not supported yet")
+		if err := qfs.ack(queueName, data); err != nil {
+			return 0, err
+		}
+		return int64(len(data)), nil
 	case "recover":
-		return 0, fmt.Errorf("not implemented: durable recover is not supported yet")
+		if err := qfs.recover(queueName, data); err != nil {
+			return 0, err
+		}
+		return int64(len(data)), nil
 	default:
 		return 0, fmt.Errorf("cannot write to: %s", path)
 	}
@@ -1095,6 +1112,73 @@ func (qfs *queueFS) clear(queueName string) error {
 	return qfs.plugin.backend.Clear(queueName)
 }
 
+type durableAckRequest struct {
+	MessageID string `json:"message_id"`
+	Receipt   string `json:"receipt"`
+}
+
+type durableRecoverRequest struct {
+	Limit int `json:"limit"`
+}
+
+func parseDurableAckRequest(data []byte) (durableAckRequest, error) {
+	var req durableAckRequest
+	if err := json.Unmarshal(data, &req); err != nil {
+		return durableAckRequest{}, fmt.Errorf("invalid durable ack payload: %w", err)
+	}
+	if req.MessageID == "" || req.Receipt == "" {
+		return durableAckRequest{}, fmt.Errorf("invalid durable ack payload: message_id and receipt are required")
+	}
+	return req, nil
+}
+
+func parseDurableRecoverRequest(data []byte) (durableRecoverRequest, error) {
+	if len(bytes.TrimSpace(data)) == 0 {
+		return durableRecoverRequest{}, nil
+	}
+	var req durableRecoverRequest
+	if err := json.Unmarshal(data, &req); err != nil {
+		return durableRecoverRequest{}, fmt.Errorf("invalid durable recover payload: %w", err)
+	}
+	if req.Limit < 0 {
+		return durableRecoverRequest{}, fmt.Errorf("invalid durable recover payload: limit must be non-negative")
+	}
+	return req, nil
+}
+
+func (qfs *queueFS) ack(queueName string, data []byte) error {
+	req, err := parseDurableAckRequest(data)
+	if err != nil {
+		return err
+	}
+
+	qfs.plugin.mu.Lock()
+	defer qfs.plugin.mu.Unlock()
+
+	durableBackend, ok := qfs.plugin.durableBackend()
+	if !ok {
+		return fmt.Errorf("durable queue backend is not available")
+	}
+	return durableBackend.Ack(queueName, req.MessageID, req.Receipt)
+}
+
+func (qfs *queueFS) recover(queueName string, data []byte) error {
+	req, err := parseDurableRecoverRequest(data)
+	if err != nil {
+		return err
+	}
+
+	qfs.plugin.mu.Lock()
+	defer qfs.plugin.mu.Unlock()
+
+	durableBackend, ok := qfs.plugin.durableBackend()
+	if !ok {
+		return fmt.Errorf("durable queue backend is not available")
+	}
+	_, err = durableBackend.RecoverExpired(queueName, time.Now().UTC(), req.Limit)
+	return err
+}
+
 // Ensure QueueFSPlugin implements ServicePlugin
 var _ plugin.ServicePlugin = (*QueueFSPlugin)(nil)
 var _ filesystem.FileSystem = (*queueFS)(nil)
@@ -1323,9 +1407,15 @@ func (h *queueFileHandle) WriteAt(data []byte, offset int64) (int, error) {
 		}
 		return len(data), nil
 	case "ack":
-		return 0, fmt.Errorf("not implemented: durable ack is not supported yet")
+		if err := h.qfs.ack(h.queueName, data); err != nil {
+			return 0, err
+		}
+		return len(data), nil
 	case "recover":
-		return 0, fmt.Errorf("not implemented: durable recover is not supported yet")
+		if err := h.qfs.recover(h.queueName, data); err != nil {
+			return 0, err
+		}
+		return len(data), nil
 	case "dequeue", "peek", "size", "stats":
 		return 0, fmt.Errorf("cannot write to %s", h.operation)
 	default:

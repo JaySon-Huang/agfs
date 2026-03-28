@@ -142,6 +142,11 @@ func (b *PostgreSQLDBBackend) QueueTableDDL(tableName string) string {
 		message_id TEXT NOT NULL,
 		data BYTEA NOT NULL,
 		timestamp BIGINT NOT NULL,
+		attempt INTEGER NOT NULL DEFAULT 0,
+		recovery_count INTEGER NOT NULL DEFAULT 0,
+		receipt TEXT NULL,
+		claimed_at BIGINT NULL,
+		lease_until BIGINT NULL,
 		created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
 		deleted BOOLEAN DEFAULT FALSE,
 		deleted_at TIMESTAMPTZ NULL
@@ -149,11 +154,27 @@ func (b *PostgreSQLDBBackend) QueueTableDDL(tableName string) string {
 }
 
 func (b *PostgreSQLDBBackend) EnsureQueueIndexes(db *sql.DB, tableName string) error {
-	indexName := fmt.Sprintf("idx_%s_deleted_id", strings.TrimPrefix(tableName, "queuefs_queue_"))
-	indexSQL := fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s ON %s(deleted, id)", quotePostgresIdentifier(indexName), tableName)
-	_, err := db.Exec(indexSQL)
-	if err != nil {
-		return fmt.Errorf("failed to create queue index: %w", err)
+	alterSQL := []string{
+		fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS attempt INTEGER NOT NULL DEFAULT 0", tableName),
+		fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS recovery_count INTEGER NOT NULL DEFAULT 0", tableName),
+		fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS receipt TEXT NULL", tableName),
+		fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS claimed_at BIGINT NULL", tableName),
+		fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS lease_until BIGINT NULL", tableName),
+	}
+	for _, stmt := range alterSQL {
+		if _, err := db.Exec(stmt); err != nil {
+			return fmt.Errorf("failed to evolve queue schema: %w", err)
+		}
+	}
+	baseName := strings.TrimPrefix(tableName, "queuefs_queue_")
+	indexSQLs := []string{
+		fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s ON %s(deleted, receipt, id)", quotePostgresIdentifier(fmt.Sprintf("idx_%s_deleted_receipt_id", baseName)), tableName),
+		fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s ON %s(deleted, lease_until)", quotePostgresIdentifier(fmt.Sprintf("idx_%s_deleted_lease_until", baseName)), tableName),
+	}
+	for _, stmt := range indexSQLs {
+		if _, err := db.Exec(stmt); err != nil {
+			return fmt.Errorf("failed to create queue index: %w", err)
+		}
 	}
 	return nil
 }

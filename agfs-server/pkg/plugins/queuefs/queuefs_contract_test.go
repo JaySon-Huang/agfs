@@ -25,7 +25,7 @@ func newTestQueueFS(t *testing.T) *queueFS {
 	return newConfiguredTestQueueFS(t, map[string]interface{}{"backend": "memory"})
 }
 
-func newConfiguredTestQueueFS(t *testing.T, cfg map[string]interface{}) *queueFS {
+func newConfiguredTestPlugin(t *testing.T, cfg map[string]interface{}) *QueueFSPlugin {
 	t.Helper()
 
 	plugin := NewQueueFSPlugin()
@@ -37,6 +37,13 @@ func newConfiguredTestQueueFS(t *testing.T, cfg map[string]interface{}) *queueFS
 			_ = plugin.backend.Close()
 		}
 	})
+	return plugin
+}
+
+func newConfiguredTestQueueFS(t *testing.T, cfg map[string]interface{}) *queueFS {
+	t.Helper()
+
+	plugin := newConfiguredTestPlugin(t, cfg)
 
 	fs, ok := plugin.GetFileSystem().(*queueFS)
 	if !ok {
