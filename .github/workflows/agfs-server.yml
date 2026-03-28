@@ -1,4 +1,4 @@
-name: agfs-server
+name: agfs-server ci
 
 on:
   push:
@@ -27,7 +27,7 @@ env:
 
 jobs:
   tests:
-    name: go test
+    name: agfs-server unit tests
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -38,12 +38,12 @@ jobs:
         with:
           go-version-file: agfs-server/go.mod
 
-      - name: Run Go tests
+      - name: Run agfs-server unit tests
         working-directory: agfs-server
         run: make test
 
   failpoint-tests:
-    name: failpoint tests
+    name: agfs-server failpoint and integration tests
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -77,7 +77,7 @@ jobs:
         working-directory: agfs-server
         run: go install github.com/pingcap/failpoint/failpoint-ctl@latest
 
-      - name: Run failpoint tests
+      - name: Run agfs-server failpoint tests
         working-directory: agfs-server
         run: make test-failpoint
 
@@ -106,13 +106,11 @@ jobs:
         if: always() && (steps.pg-ready.outcome == 'failure' || steps.pg-tests.outcome == 'failure')
         run: docker logs ${{ job.services.postgres.id }} || true
 
-      - name: Publish advisory PostgreSQL summary
+      - name: Publish PostgreSQL integration test summary
         if: always()
         run: |
           {
-            echo "## Advisory PostgreSQL integration check"
-            echo
-            echo "This check is advisory during the stabilization phase and does not block the workflow."
+            echo "## PostgreSQL integration tests"
             echo
             echo "| Check | Outcome |"
             echo "| --- | --- |"
@@ -130,7 +128,7 @@ jobs:
             ~/.tiup/manifest
           key: ${{ runner.os }}-tiup-${{ env.TIDB_VERSION }}
 
-      - name: Install TiUP
+      - name: Install TiUP and TiDB components
         id: install-tiup
         continue-on-error: true
         run: |
@@ -191,13 +189,11 @@ jobs:
             kill "$(cat /tmp/tiup-playground.pid)" || true
           fi
 
-      - name: Publish advisory TiDB summary
+      - name: Publish TiDB integration test summary
         if: always()
         run: |
           {
-            echo "## Advisory TiDB integration check"
-            echo
-            echo "This check is advisory during the stabilization phase and does not block the workflow."
+            echo "## TiDB integration tests"
             echo
             echo "| Check | Outcome |"
             echo "| --- | --- |"

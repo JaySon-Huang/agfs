@@ -41,3 +41,6 @@ build/
 *.pyc
 __pycache__/
 .idea
+
+# local review artifacts
+second_opinion*
