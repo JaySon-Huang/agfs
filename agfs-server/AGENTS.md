@@ -14,6 +14,7 @@
 - `pkg/plugin/`: plugin interfaces, loader, config validation helpers, WASM/native plugin support.
 - `pkg/plugins/`: built-in filesystem/service plugins such as `queuefs`, `memfs`, `s3fs`, `sqlfs`, `vectorfs`.
 - `pkg/handlers/`: HTTP API handlers and traffic monitoring.
+- `docs/concepts/`: concept-level design notes and semantic contracts for bigger features; start here when a task references a design or RFC-like behavior.
 - `scripts/run_failpoint_tests.py`: the only supported entrypoint for failpoint tests.
 
 ## Build and run commands
