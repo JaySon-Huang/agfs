@@ -202,3 +202,45 @@ jobs:
             echo "| TiDB readiness | ${{ steps.tidb-ready.outcome || 'skipped' }} |"
             echo "| TiDB integration tests | ${{ steps.tidb-tests.outcome || 'skipped' }} |"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Enforce PostgreSQL and TiDB integration test results
+        if: always()
+        run: |
+          failed=0
+
+          check_required() {
+            local name="$1"
+            local outcome="$2"
+            if [ "$outcome" != "success" ]; then
+              echo "$name did not succeed (outcome: $outcome)"
+              failed=1
+            fi
+          }
+
+          check_required "PostgreSQL readiness" "${{ steps.pg-ready.outcome }}"
+          if [ "${{ steps.pg-ready.outcome }}" = "success" ]; then
+            check_required "PostgreSQL integration tests" "${{ steps.pg-tests.outcome }}"
+          else
+            echo "PostgreSQL integration tests were skipped because readiness did not succeed"
+          fi
+
+          check_required "TiUP install" "${{ steps.install-tiup.outcome }}"
+          if [ "${{ steps.install-tiup.outcome }}" = "success" ]; then
+            check_required "TiDB playground start" "${{ steps.tidb-start.outcome }}"
+          else
+            echo "TiDB playground start was skipped because TiUP installation did not succeed"
+          fi
+
+          if [ "${{ steps.tidb-start.outcome }}" = "success" ]; then
+            check_required "TiDB readiness" "${{ steps.tidb-ready.outcome }}"
+          else
+            echo "TiDB readiness was skipped because playground startup did not succeed"
+          fi
+
+          if [ "${{ steps.tidb-ready.outcome }}" = "success" ]; then
+            check_required "TiDB integration tests" "${{ steps.tidb-tests.outcome }}"
+          else
+            echo "TiDB integration tests were skipped because readiness did not succeed"
+          fi
+
+          exit "$failed"
