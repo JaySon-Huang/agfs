@@ -16,6 +16,7 @@ type durableTestBackend struct {
 	claimFound        bool
 	statsResponse     QueueStats
 	claimCalls        int
+	lastClaimRequest  ClaimRequest
 	dequeueCalls      int
 	ackCalls          int
 	lastAckMessageID  string
@@ -116,6 +117,7 @@ func (b *durableTestBackend) QueueExists(queueName string) (bool, error) {
 
 func (b *durableTestBackend) Claim(queueName string, req ClaimRequest) (ClaimedMessage, bool, error) {
 	b.claimCalls++
+	b.lastClaimRequest = req
 	return b.claimResponse, b.claimFound, nil
 }
 
@@ -291,6 +293,9 @@ func TestQueueFSDurableModeMapsDequeueToClaimAndStats(t *testing.T) {
 	}
 	if backend.claimCalls != 1 {
 		t.Fatalf("claim calls = %d, want 1", backend.claimCalls)
+	}
+	if backend.lastClaimRequest.LeaseDuration != queueFSDurableDefaultLeaseDuration {
+		t.Fatalf("claim lease duration = %s, want %s", backend.lastClaimRequest.LeaseDuration, queueFSDurableDefaultLeaseDuration)
 	}
 	if backend.dequeueCalls != 0 {
 		t.Fatalf("dequeue calls = %d, want 0", backend.dequeueCalls)

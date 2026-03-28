@@ -21,6 +21,9 @@ const (
 	PluginName       = "queuefs" // Name of this plugin
 	queueModeFIFO    = "fifo"
 	queueModeDurable = "durable"
+	// Keep the QueueFS default lease explicit at the filesystem layer so every
+	// durable backend observes the same claim behavior through /dequeue.
+	queueFSDurableDefaultLeaseDuration = 30 * time.Second
 )
 
 // Meta values for QueueFS plugin
@@ -1022,7 +1025,7 @@ func (qfs *queueFS) dequeue(queueName string) ([]byte, error) {
 			return nil, fmt.Errorf("durable queue backend is not available")
 		}
 
-		msg, found, err := durableBackend.Claim(queueName, ClaimRequest{})
+		msg, found, err := durableBackend.Claim(queueName, ClaimRequest{LeaseDuration: queueFSDurableDefaultLeaseDuration})
 		if err != nil {
 			return nil, err
 		}
