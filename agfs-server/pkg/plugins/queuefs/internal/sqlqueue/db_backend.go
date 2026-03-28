@@ -3,7 +3,6 @@ package sqlqueue
 import (
 	"database/sql"
 	"fmt"
-	"regexp"
 	"strings"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/plugin/config"
@@ -19,21 +18,6 @@ type DBBackend interface {
 	RegistryInsertSQL() string
 	Rebind(query string) string
 	BoolLiteral(value bool) string
-}
-
-func extractDatabaseName(dsn string, configDB string) string {
-	if dsn != "" {
-		re := regexp.MustCompile(`\)/([^?]+)`)
-		if matches := re.FindStringSubmatch(dsn); len(matches) > 1 {
-			return matches[1]
-		}
-	}
-	return configDB
-}
-
-func removeDatabaseFromDSN(dsn string) string {
-	re := regexp.MustCompile(`\)/[^?]+(\?|$)`)
-	return re.ReplaceAllString(dsn, ")/$1")
 }
 
 // sanitizeTableName converts a queue name to a safe table name.
