@@ -26,8 +26,11 @@ type claimedItem struct {
 
 // Queue represents a single message queue for the memory backend.
 type Queue struct {
-	pending         []queueItem
-	processing      map[string]claimedItem
+	pending    []queueItem
+	processing map[string]claimedItem
+	// processingOrder preserves claim order for processing items because Go map
+	// iteration is intentionally nondeterministic.
+	processingOrder []string
 	recoveries      int
 	mu              sync.Mutex
 	lastEnqueueTime time.Time // Tracks the timestamp of the most recently enqueued message
@@ -73,6 +76,7 @@ func (b *Backend) getOrCreateQueue(queueName string) *Queue {
 	queue := &Queue{
 		pending:         []queueItem{},
 		processing:      make(map[string]claimedItem),
+		processingOrder: []string{},
 		lastEnqueueTime: time.Time{},
 	}
 	b.queues[queueName] = queue
@@ -161,6 +165,7 @@ func (b *Backend) Clear(queueName string) error {
 
 	queue.pending = []queueItem{}
 	queue.processing = make(map[string]claimedItem)
+	queue.processingOrder = []string{}
 	queue.recoveries = 0
 	queue.lastEnqueueTime = time.Time{}
 	return nil
@@ -261,6 +266,9 @@ func (b *Backend) Claim(queueName string, req model.ClaimRequest) (model.Claimed
 		leaseUntil: claimedAt.Add(leaseDuration),
 	}
 	queue.processing[item.message.ID] = claimed
+	// Keep a parallel ordered list so recovery can restore expired claims to the
+	// pending queue deterministically.
+	queue.processingOrder = append(queue.processingOrder, item.message.ID)
 
 	return model.ClaimedMessage{
 		MessageID:  item.message.ID,
@@ -285,6 +293,7 @@ func (b *Backend) Ack(queueName string, messageID string, receipt string) error 
 		return fmt.Errorf("claim is no longer active for message %q", messageID)
 	}
 	delete(queue.processing, messageID)
+	queue.removeProcessingOrderLocked(messageID)
 	return nil
 }
 
@@ -300,6 +309,7 @@ func (b *Backend) Release(queueName string, messageID string, req model.ReleaseR
 		return fmt.Errorf("claim is no longer active for message %q", messageID)
 	}
 	delete(queue.processing, messageID)
+	queue.removeProcessingOrderLocked(messageID)
 	// Requeue at the front so an explicit release preserves FIFO semantics for the
 	// message that was previously at the head of the queue.
 	queue.pending = append([]queueItem{claimed.item}, queue.pending...)
@@ -322,11 +332,20 @@ func (b *Backend) RecoverExpired(queueName string, now time.Time, limit int) (in
 	}
 	recovered := 0
 	toPrepend := make([]queueItem, 0)
-	for messageID, claimed := range queue.processing {
+	remainingProcessingOrder := make([]string, 0, len(queue.processingOrder))
+	// Walk the explicit claim order rather than queue.processing so recovered
+	// items re-enter pending in a stable, FIFO-compatible order.
+	for _, messageID := range queue.processingOrder {
+		claimed, ok := queue.processing[messageID]
+		if !ok {
+			continue
+		}
 		if limit > 0 && recovered >= limit {
-			break
+			remainingProcessingOrder = append(remainingProcessingOrder, messageID)
+			continue
 		}
 		if claimed.leaseUntil.After(now) {
+			remainingProcessingOrder = append(remainingProcessingOrder, messageID)
 			continue
 		}
 		delete(queue.processing, messageID)
@@ -335,13 +354,26 @@ func (b *Backend) RecoverExpired(queueName string, now time.Time, limit int) (in
 		toPrepend = append(toPrepend, item)
 		recovered++
 	}
+	queue.processingOrder = remainingProcessingOrder
 	// Reverse the prepend order so multiple recovered claims become pending again
-	// in the same FIFO order they originally occupied.
+	// in the same claim order they originally occupied in processing.
 	for i := len(toPrepend) - 1; i >= 0; i-- {
 		queue.pending = append([]queueItem{toPrepend[i]}, queue.pending...)
 	}
 	queue.recoveries += recovered
 	return recovered, nil
+}
+
+func (q *Queue) removeProcessingOrderLocked(messageID string) {
+	// processingOrder is small and only mutated while holding queue.mu, so a
+	// linear removal keeps the bookkeeping obvious and predictable.
+	for i, current := range q.processingOrder {
+		if current != messageID {
+			continue
+		}
+		q.processingOrder = append(q.processingOrder[:i], q.processingOrder[i+1:]...)
+		return
+	}
 }
 
 func (b *Backend) Stats(queueName string) (model.QueueStats, error) {

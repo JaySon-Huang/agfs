@@ -112,3 +112,59 @@ func TestBackendDurableLifecycle(t *testing.T) {
 		t.Fatalf("final stats = %+v, want pending=0 processing=0 recoveries=1", stats)
 	}
 }
+
+func TestBackendRecoverExpiredPreservesClaimOrder(t *testing.T) {
+	backend := NewBackend()
+	queueName := "jobs"
+	now := time.Unix(1711601000, 0).UTC()
+	payloads := []string{"first", "second", "third", "fourth", "fifth", "sixth", "seventh"}
+
+	if err := backend.CreateQueue(queueName); err != nil {
+		t.Fatalf("create queue: %v", err)
+	}
+	for i, payload := range payloads {
+		if err := backend.Enqueue(queueName, model.QueueMessage{
+			ID:        payload,
+			Data:      payload,
+			Timestamp: now.Add(time.Duration(i) * time.Second),
+		}); err != nil {
+			t.Fatalf("enqueue %q: %v", payload, err)
+		}
+	}
+
+	for _, payload := range payloads[:len(payloads)-1] {
+		claimed, found, err := backend.Claim(queueName, model.ClaimRequest{LeaseDuration: time.Second})
+		if err != nil {
+			t.Fatalf("claim %q: %v", payload, err)
+		}
+		if !found || claimed.MessageID != payload {
+			t.Fatalf("unexpected claim result for %q: found=%v claimed=%+v", payload, found, claimed)
+		}
+	}
+
+	recovered, err := backend.RecoverExpired(queueName, time.Now().UTC().Add(2*time.Second), 0)
+	if err != nil {
+		t.Fatalf("recover expired messages: %v", err)
+	}
+	if recovered != len(payloads)-1 {
+		t.Fatalf("recovered count = %d, want %d", recovered, len(payloads)-1)
+	}
+
+	for _, want := range payloads {
+		claimed, found, err := backend.Claim(queueName, model.ClaimRequest{})
+		if err != nil {
+			t.Fatalf("claim after recovery for %q: %v", want, err)
+		}
+		if !found {
+			t.Fatalf("expected recovered queue to yield %q", want)
+		}
+		if claimed.MessageID != want {
+			t.Fatalf("claim order after recovery = %q, want %q", claimed.MessageID, want)
+		}
+	}
+	if _, found, err := backend.Claim(queueName, model.ClaimRequest{}); err != nil {
+		t.Fatalf("claim empty recovered queue: %v", err)
+	} else if found {
+		t.Fatal("expected recovered queue to be empty after draining")
+	}
+}
