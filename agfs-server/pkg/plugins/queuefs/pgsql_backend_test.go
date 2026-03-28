@@ -1,12 +1,14 @@
 package queuefs
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -77,6 +79,10 @@ func newPGTestQueueFS(t *testing.T, database string) *queueFS {
 
 func newPGTestDatabaseName() string {
 	return fmt.Sprintf("queuefs_pg_test_%d", time.Now().UnixNano())
+}
+
+func newPGNamedDatabaseName(suffix string) string {
+	return fmt.Sprintf("queuefs_pg_test_%d_%s", time.Now().UnixNano(), suffix)
 }
 
 func TestQueueFSPGSQLFileRegression(t *testing.T) {
@@ -197,6 +203,121 @@ func TestQueueFSPGSQLConfigUsesDSN(t *testing.T) {
 	if _, ok := config["dsn"].(string); !ok || config["dsn"] == "" {
 		t.Fatalf("expected non-empty dsn in config: %+v", config)
 	}
+}
+
+func TestQueueFSPGSQLConfigDatabaseOverridesDSN(t *testing.T) {
+	baseDSN := os.Getenv("PG_TEST_DSN")
+	if baseDSN == "" {
+		t.Skip("set PG_TEST_DSN to run PostgreSQL integration tests")
+	}
+
+	baseURL, err := url.Parse(baseDSN)
+	if err != nil {
+		t.Fatalf("parse PG_TEST_DSN: %v", err)
+	}
+	query := baseURL.Query()
+	if query.Get("sslmode") == "" {
+		query.Set("sslmode", "require")
+	}
+	baseURL.RawQuery = query.Encode()
+
+	dsnDatabase := newPGNamedDatabaseName("dsn")
+	targetDatabase := newPGNamedDatabaseName("target")
+
+	adminURL := *baseURL
+	adminURL.Path = "/postgres"
+	adminDSN := adminURL.String()
+	ensurePGDatabase(t, adminDSN, dsnDatabase)
+	ensurePGDatabase(t, adminDSN, targetDatabase)
+
+	dsnURL := *baseURL
+	dsnURL.Path = "/" + dsnDatabase
+	targetURL := *baseURL
+	targetURL.Path = "/" + targetDatabase
+
+	password, _ := baseURL.User.Password()
+	port := baseURL.Port()
+	if port == "" {
+		port = "5432"
+	}
+
+	plugin := NewQueueFSPlugin()
+	if err := plugin.Initialize(map[string]interface{}{
+		"backend":   "pgsql",
+		"dsn":       dsnURL.String(),
+		"host":      baseURL.Hostname(),
+		"port":      port,
+		"user":      baseURL.User.Username(),
+		"password":  password,
+		"database":  targetDatabase,
+		"admin_dsn": adminDSN,
+	}); err != nil {
+		t.Fatalf("initialize pgsql queuefs with overridden database: %v", err)
+	}
+	t.Cleanup(func() {
+		if plugin.backend != nil {
+			_ = plugin.backend.Close()
+		}
+	})
+
+	fs, ok := plugin.GetFileSystem().(*queueFS)
+	if !ok {
+		t.Fatalf("unexpected filesystem type %T", plugin.GetFileSystem())
+	}
+	if err := fs.Mkdir("/jobs", 0o755); err != nil {
+		t.Fatalf("mkdir /jobs: %v", err)
+	}
+
+	if got := pgQueueRegistryCount(t, targetURL.String()); got != 1 {
+		t.Fatalf("target database queue registry count = %d, want 1", got)
+	}
+	if got := pgQueueRegistryCount(t, dsnURL.String()); got != 0 {
+		t.Fatalf("dsn database queue registry count = %d, want 0", got)
+	}
+}
+
+func ensurePGDatabase(t *testing.T, adminDSN string, database string) {
+	t.Helper()
+
+	db, err := sql.Open("pgx", adminDSN)
+	if err != nil {
+		t.Fatalf("open admin database: %v", err)
+	}
+	defer db.Close()
+
+	quotedDatabase := `"` + strings.ReplaceAll(database, `"`, `""`) + `"`
+	if _, err := db.Exec(fmt.Sprintf("CREATE DATABASE %s", quotedDatabase)); err != nil && !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("create database %q: %v", database, err)
+	}
+}
+
+func pgQueueRegistryCount(t *testing.T, dsn string) int {
+	t.Helper()
+
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open database %q: %v", dsn, err)
+	}
+	defer db.Close()
+
+	var exists bool
+	if err := db.QueryRow(`SELECT EXISTS (
+		SELECT 1
+		FROM information_schema.tables
+		WHERE table_schema = current_schema()
+		  AND table_name = 'queuefs_registry'
+	)`).Scan(&exists); err != nil {
+		t.Fatalf("check queuefs_registry table in %q: %v", dsn, err)
+	}
+	if !exists {
+		return 0
+	}
+
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM queuefs_registry`).Scan(&count); err != nil {
+		t.Fatalf("count queuefs_registry rows in %q: %v", dsn, err)
+	}
+	return count
 }
 
 func TestQueueFSPGSQLConcurrentDequeueRegression(t *testing.T) {
