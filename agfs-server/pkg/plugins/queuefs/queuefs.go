@@ -359,10 +359,17 @@ type queueFS struct {
 	plugin *QueueFSPlugin
 }
 
-var allQueueOperations = map[string]bool{
+var fifoQueueOperations = map[string]bool{
 	"enqueue": true,
 	"dequeue": true,
 	"peek":    true,
+	"size":    true,
+	"clear":   true,
+}
+
+var durableQueueOperations = map[string]bool{
+	"enqueue": true,
+	"dequeue": true,
 	"size":    true,
 	"stats":   true,
 	"clear":   true,
@@ -379,23 +386,9 @@ func (q *QueueFSPlugin) queueMode() string {
 
 func (qfs *queueFS) queueOperations() map[string]bool {
 	if qfs.plugin.queueMode() == queueModeDurable {
-		return map[string]bool{
-			"enqueue": true,
-			"dequeue": true,
-			"size":    true,
-			"stats":   true,
-			"clear":   true,
-			"ack":     true,
-			"recover": true,
-		}
+		return durableQueueOperations
 	}
-	return map[string]bool{
-		"enqueue": true,
-		"dequeue": true,
-		"peek":    true,
-		"size":    true,
-		"clear":   true,
-	}
+	return fifoQueueOperations
 }
 
 func (q *QueueFSPlugin) durableBackend() (DurableQueueBackend, bool) {
@@ -407,8 +400,9 @@ func (q *QueueFSPlugin) durableBackend() (DurableQueueBackend, bool) {
 }
 
 // parseQueuePath parses a path like "/queue_name/operation" or "/dir/queue_name/operation"
-// Returns (queueName, operation, isDir, error)
-func parseQueuePath(path string) (queueName string, operation string, isDir bool, err error) {
+// using the control files exposed by the current queue mode.
+// Returns (queueName, operation, isDir, error).
+func parseQueuePath(path string, operations map[string]bool) (queueName string, operation string, isDir bool, err error) {
 	// Clean the path
 	path = filepath.Clean(path)
 
@@ -428,7 +422,7 @@ func parseQueuePath(path string) (queueName string, operation string, isDir bool
 
 	// Check if the last component is a queue operation
 	lastPart := parts[len(parts)-1]
-	if allQueueOperations[lastPart] {
+	if operations[lastPart] {
 		// This is a queue operation file
 		if len(parts) == 1 {
 			return "", "", false, fmt.Errorf("invalid path: operation without queue name")
@@ -449,7 +443,7 @@ func (qfs *queueFS) isValidQueueOperation(op string) bool {
 }
 
 func (qfs *queueFS) Create(path string) error {
-	_, operation, isDir, err := parseQueuePath(path)
+	_, operation, isDir, err := parseQueuePath(path, qfs.queueOperations())
 	if err != nil {
 		return err
 	}
@@ -467,7 +461,7 @@ func (qfs *queueFS) Create(path string) error {
 }
 
 func (qfs *queueFS) Mkdir(path string, perm uint32) error {
-	queueName, _, isDir, err := parseQueuePath(path)
+	queueName, _, isDir, err := parseQueuePath(path, qfs.queueOperations())
 	if err != nil {
 		return err
 	}
@@ -488,7 +482,7 @@ func (qfs *queueFS) Mkdir(path string, perm uint32) error {
 }
 
 func (qfs *queueFS) Remove(path string) error {
-	_, operation, isDir, err := parseQueuePath(path)
+	_, operation, isDir, err := parseQueuePath(path, qfs.queueOperations())
 	if err != nil {
 		return err
 	}
@@ -505,7 +499,7 @@ func (qfs *queueFS) Remove(path string) error {
 }
 
 func (qfs *queueFS) RemoveAll(path string) error {
-	queueName, _, isDir, err := parseQueuePath(path)
+	queueName, _, isDir, err := parseQueuePath(path, qfs.queueOperations())
 	if err != nil {
 		return err
 	}
@@ -527,7 +521,7 @@ func (qfs *queueFS) Read(path string, offset int64, size int64) ([]byte, error) 
 		return plugin.ApplyRangeRead(data, offset, size)
 	}
 
-	queueName, operation, isDir, err := parseQueuePath(path)
+	queueName, operation, isDir, err := parseQueuePath(path, qfs.queueOperations())
 	if err != nil {
 		return nil, err
 	}
@@ -569,7 +563,7 @@ func (qfs *queueFS) Read(path string, offset int64, size int64) ([]byte, error) 
 }
 
 func (qfs *queueFS) Write(path string, data []byte, offset int64, flags filesystem.WriteFlag) (int64, error) {
-	queueName, operation, isDir, err := parseQueuePath(path)
+	queueName, operation, isDir, err := parseQueuePath(path, qfs.queueOperations())
 	if err != nil {
 		return 0, err
 	}
@@ -617,7 +611,7 @@ func (qfs *queueFS) Write(path string, data []byte, offset int64, flags filesyst
 }
 
 func (qfs *queueFS) ReadDir(path string) ([]filesystem.FileInfo, error) {
-	queueName, _, isDir, err := parseQueuePath(path)
+	queueName, _, isDir, err := parseQueuePath(path, qfs.queueOperations())
 	if err != nil {
 		return nil, err
 	}
@@ -850,7 +844,7 @@ func (qfs *queueFS) Stat(path string) (*filesystem.FileInfo, error) {
 		}, nil
 	}
 
-	queueName, operation, isDir, err := parseQueuePath(path)
+	queueName, operation, isDir, err := parseQueuePath(path, qfs.queueOperations())
 	if err != nil {
 		return nil, err
 	}
@@ -1224,7 +1218,7 @@ var queueHandleManager = &handleManager{
 
 // OpenHandle opens a file and returns a handle for stateful operations
 func (qfs *queueFS) OpenHandle(path string, flags filesystem.OpenFlag, mode uint32) (filesystem.FileHandle, error) {
-	queueName, operation, isDir, err := parseQueuePath(path)
+	queueName, operation, isDir, err := parseQueuePath(path, qfs.queueOperations())
 	if err != nil {
 		return nil, err
 	}

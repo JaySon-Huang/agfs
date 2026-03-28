@@ -185,8 +185,24 @@ func TestQueueFSDefaultModeIsFIFO(t *testing.T) {
 	if _, err := fs.Stat("/jobs/ack"); err == nil || !strings.Contains(err.Error(), "no such file") {
 		t.Fatalf("stat /jobs/ack error = %v, want missing path", err)
 	}
-	if _, err := fs.OpenHandle("/jobs/recover", filesystem.O_WRONLY, 0); err == nil || !strings.Contains(err.Error(), "unknown operation") {
-		t.Fatalf("open fifo recover handle error = %v, want unknown operation", err)
+
+	for _, queueName := range []string{"/ack", "/recover", "/stats"} {
+		if err := fs.Mkdir(queueName, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", queueName, err)
+		}
+		entries, err := fs.ReadDir(queueName)
+		if err != nil {
+			t.Fatalf("readdir %s: %v", queueName, err)
+		}
+		files := queueDirEntryNames(entries)
+		if _, ok := files["peek"]; !ok {
+			t.Fatalf("fifo queue %s missing peek control file in %+v", queueName, entries)
+		}
+		for _, name := range []string{"ack", "recover", "stats"} {
+			if _, ok := files[name]; ok {
+				t.Fatalf("fifo queue %s should not expose %q in %+v", queueName, name, entries)
+			}
+		}
 	}
 }
 
@@ -230,8 +246,26 @@ func TestQueueFSDurableModeExposesDurableOnlySurface(t *testing.T) {
 	if _, err := fs.Stat("/jobs/peek"); err == nil || !strings.Contains(err.Error(), "no such file") {
 		t.Fatalf("stat /jobs/peek error = %v, want missing path", err)
 	}
-	if _, err := fs.OpenHandle("/jobs/peek", filesystem.O_RDONLY, 0); err == nil || !strings.Contains(err.Error(), "unknown operation") {
-		t.Fatalf("open durable peek handle error = %v, want unknown operation", err)
+	if err := fs.Mkdir("/peek", 0o755); err != nil {
+		t.Fatalf("mkdir /peek: %v", err)
+	}
+	peekEntries, err := fs.ReadDir("/peek")
+	if err != nil {
+		t.Fatalf("readdir /peek: %v", err)
+	}
+	peekFiles := queueDirEntryNames(peekEntries)
+	if _, ok := peekFiles["peek"]; ok {
+		t.Fatalf("durable queue /peek should not expose peek control file in %+v", peekEntries)
+	}
+	for _, name := range []string{"enqueue", "dequeue", "size", "stats", "clear", "ack", "recover"} {
+		if _, ok := peekFiles[name]; !ok {
+			t.Fatalf("durable queue /peek missing %q in %+v", name, peekEntries)
+		}
+	}
+	if handle, err := fs.OpenHandle("/peek/dequeue", filesystem.O_RDONLY, 0); err != nil {
+		t.Fatalf("open durable queue named peek handle: %v", err)
+	} else if err := handle.Close(); err != nil {
+		t.Fatalf("close durable queue named peek handle: %v", err)
 	}
 	if _, err := fs.Read("/jobs/recover", 0, -1); err == nil || !strings.Contains(err.Error(), "write-only") {
 		t.Fatalf("read /jobs/recover error = %v, want write-only", err)
