@@ -7,12 +7,20 @@ on:
       - ".github/workflows/agfs-server.yml"
       - "agfs-server/**"
       - "agfs-sdk/go/**"
+      - "!agfs-server/*.md"
+      - "!agfs-server/**/*.md"
+      - "!agfs-sdk/go/*.md"
+      - "!agfs-sdk/go/**/*.md"
   pull_request:
     branches: [master, main, develop]
     paths:
       - ".github/workflows/agfs-server.yml"
       - "agfs-server/**"
       - "agfs-sdk/go/**"
+      - "!agfs-server/*.md"
+      - "!agfs-server/**/*.md"
+      - "!agfs-sdk/go/*.md"
+      - "!agfs-sdk/go/**/*.md"
   workflow_dispatch:
 
 permissions:
